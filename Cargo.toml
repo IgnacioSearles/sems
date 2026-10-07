@@ -1,0 +1,23 @@
+[package]
+name = "sems"
+version = "0.1.0"
+edition = "2024"
+description = "Semantic search for local files, powered by EmbeddingGemma 2"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+fast_image_resize = { version = "6.1", features = ["image"] }
+image = "0.25"
+# ort 2.x has not had a stable release yet; pin the exact release candidate.
+# load-dynamic: onnxruntime.dll is loaded from an explicit path at runtime. Static linking needs the
+# VS 2022 STL, and loading by name on Windows can pick up the outdated copy in System32.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-27"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+# Without default features: esaxx (tokenizer training only) links the static CRT, which clashes with ort.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+[profile.release]
+debug = "line-tables-only"
