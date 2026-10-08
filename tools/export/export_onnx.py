@@ -14,7 +14,7 @@ export is faithful).
 
 Usage:
     python export_onnx.py --model ../../models/embeddinggemma-2 --out ../../models/onnx \
-        --reference ../../models/reference.json --image ../../models/fixtures/beach.png
+        --reference ../../models/reference.json --image ../../tests/fixtures/images/beach.png
 """
 
 import argparse

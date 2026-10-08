@@ -105,11 +105,17 @@ impl EmbeddingModel {
 
     /// Embeds texts as-is; callers are responsible for task prefixes such as `task: search result | query: `.
     pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Embedding>, EmbeddingError> {
-        if texts.is_empty() {
+        let token_ids = self.tokenize(texts)?;
+        self.embed_token_sequences(&token_ids)
+    }
+
+    /// Embeds already-tokenized sequences (from [`Self::tokenize`]) as one padded batch. Lets
+    /// callers tokenize once to plan batch sizes before running inference.
+    pub fn embed_token_sequences(&mut self, sequences: &[Vec<i64>]) -> Result<Vec<Embedding>, EmbeddingError> {
+        if sequences.is_empty() {
             return Ok(Vec::new());
         }
-        let token_ids = self.tokenize(texts)?;
-        let batch = PaddedBatch::new(&token_ids, self.config.text_config.pad_token_id);
+        let batch = PaddedBatch::new(sequences, self.config.text_config.pad_token_id);
         let inputs_embeds = self.embed_tokens(&batch)?;
         self.encode(inputs_embeds, &batch)
     }

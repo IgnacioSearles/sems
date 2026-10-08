@@ -143,7 +143,8 @@ fn image_embedding_matches_reference_end_to_end() {
     let mut model = load_model();
     for reference in load_references("image") {
         let expected_pixels = reference_image(&reference);
-        let image = image::open(models_directory().join("fixtures").join(&reference.input)).unwrap();
+        let image_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/images").join(&reference.input);
+        let image = image::open(image_path).unwrap();
         let ours = sems::embedding::ImagePreprocessor::new(&model.config().vision_config).preprocess(&image).unwrap();
 
         assert_eq!(ours.position_ids, expected_pixels.position_ids, "patch layout differs");

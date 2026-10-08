@@ -1,1 +1,8 @@
+pub mod chunking;
+pub mod discovery;
 pub mod embedding;
+pub mod encoder;
+pub mod indexer;
+pub mod render;
+pub mod search;
+pub mod store;

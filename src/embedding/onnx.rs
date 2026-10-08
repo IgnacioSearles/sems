@@ -23,25 +23,57 @@ pub struct OnnxRuntime {
 }
 
 impl OnnxRuntime {
-    /// Loads `onnxruntime.dll` (or the platform equivalent) from an explicit path.
+    /// Loads `onnxruntime.dll` (or the platform equivalent) from an explicit path. The library's
+    /// own dependencies (DirectML.dll, CUDA and cuDNN) are expected in the same directory.
     pub fn load(library_path: &Path) -> Result<Self, EmbeddingError> {
+        let runtime_library_error =
+            |message: String| EmbeddingError::RuntimeLibrary { path: library_path.to_path_buf(), message };
         if !library_path.is_file() {
             return Err(EmbeddingError::ReadFile {
                 path: library_path.to_path_buf(),
                 source: std::io::Error::new(std::io::ErrorKind::NotFound, "ONNX Runtime library not found"),
             });
         }
-        let builder = ort::init_from(library_path).map_err(|error| EmbeddingError::RuntimeLibrary {
-            path: library_path.to_path_buf(),
-            message: error.to_string(),
-        })?;
+        if let Some(directory) = library_path.parent() {
+            search_directory_for_dependencies(directory).map_err(|error| runtime_library_error(error.to_string()))?;
+        }
+        let builder = ort::init_from(library_path).map_err(|error| runtime_library_error(error.to_string()))?;
         builder.with_name("sems").commit();
         Ok(Self { _private: () })
     }
 }
 
-/// Where a graph runs. GPU devices require the matching ONNX Runtime build (onnxruntime-gpu with
-/// CUDA 12 + cuDNN 9 on the DLL search path, or onnxruntime-directml).
+/// Makes `directory` part of the DLL search order for libraries loaded by name.
+///
+/// ONNX Runtime's CUDA provider loads cuDNN with a bare `LoadLibrary("cudnn64_9.dll")` at first
+/// use, and Windows does not search the requesting DLL's directory for that, so a runtime folder
+/// with everything side by side would still fail without this. Process-wide, which is fine: a
+/// process only ever loads one ONNX Runtime.
+#[cfg(windows)]
+fn search_directory_for_dependencies(directory: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetDllDirectoryW(path_name: *const u16) -> i32;
+    }
+
+    let wide: Vec<u16> = directory.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call, which copies it.
+    if unsafe { SetDllDirectoryW(wide.as_ptr()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Other platforms resolve dependencies through the library's rpath.
+#[cfg(not(windows))]
+fn search_directory_for_dependencies(_directory: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Where a graph runs. GPU devices require the matching ONNX Runtime build: the CUDA pack
+/// (onnxruntime-gpu with CUDA 13 and cuDNN 9 beside it) or the DirectML build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionDevice {
     Cpu,

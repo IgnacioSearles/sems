@@ -1,0 +1,78 @@
+[
+  {
+    "query": "limit how many requests a client can make per second",
+    "expected": "code/rate_limiter.py"
+  },
+  {
+    "query": "try again with increasing delays when a network call fails",
+    "expected": "code/retry.ts"
+  },
+  {
+    "query": "check that the bearer token is valid before handling the request",
+    "expected": "code/auth_middleware.go"
+  },
+  {
+    "query": "write table rows to a comma separated file",
+    "expected": "code/csv_export.rs"
+  },
+  {
+    "query": "make small preview versions of photos",
+    "expected": "code/image_thumbnail.py"
+  },
+  {
+    "query": "database tables for user accounts and logins",
+    "expected": "code/schema.sql"
+  },
+  {
+    "query": "convert a timestamp to another time zone",
+    "expected": "code/date_utils.js"
+  },
+  {
+    "query": "what did we decide about next quarter's spending",
+    "expected": "notes/meeting_2026_09_12.md"
+  },
+  {
+    "query": "how to bake with overripe bananas",
+    "expected": "notes/recipes/banana_bread.md"
+  },
+  {
+    "query": "trip itinerary with temples and bullet trains",
+    "expected": "notes/travel_japan.md"
+  },
+  {
+    "query": "steps for a new employee to get set up",
+    "expected": "docs/onboarding.md"
+  },
+  {
+    "query": "why did the database go down",
+    "expected": "docs/incident_2026_08_03.md"
+  },
+  {
+    "query": "enable HTTPS and compression on the web server",
+    "expected": "config/nginx.conf"
+  },
+  {
+    "query": "weekly gym routine",
+    "expected": "notes/training.txt"
+  },
+  {
+    "query": "letter asking to fix the heating in my apartment",
+    "expected": "letters/landlord.txt"
+  },
+  {
+    "query": "TokenBucket",
+    "expected": "code/rate_limiter.py"
+  },
+  {
+    "query": "escape_field",
+    "expected": "code/csv_export.rs"
+  },
+  {
+    "query": "receta de pan de plátano",
+    "expected": "notes/recipes/banana_bread.md"
+  },
+  {
+    "query": "¿por qué se cayó la base de datos?",
+    "expected": "docs/incident_2026_08_03.md"
+  }
+]
