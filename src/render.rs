@@ -18,22 +18,51 @@ pub enum OutputFormat {
     Json,
 }
 
-/// ANSI styling, enabled only when writing to a terminal so piped output stays clean.
+/// Terminal decorations, enabled only when writing to a terminal so piped output stays clean.
 #[derive(Debug, Clone, Copy)]
 pub struct Style {
     pub color: bool,
+    /// Wrap result paths in OSC 8 hyperlinks, which supporting terminals open on (Ctrl+)click.
+    pub hyperlinks: bool,
 }
 
 impl Style {
+    pub const PLAIN: Self = Self { color: false, hyperlinks: false };
+
     fn paint(self, code: &str, text: &str) -> String {
         if self.color { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_string() }
     }
+
+    /// `text` as a link to `path`. OSC 8: `ESC ] 8 ; ; URI ESC \ text ESC ] 8 ; ; ESC \`.
+    fn link(self, path: &Path, text: &str) -> String {
+        if self.hyperlinks { format!("\x1b]8;;{}\x1b\\{text}\x1b]8;;\x1b\\", file_uri(path)) } else { text.to_string() }
+    }
+}
+
+/// A `file://` URI for an absolute path, percent-encoding everything but unreserved characters and
+/// separators so spaces and non-ASCII names survive (`C:\My Docs\é.pdf` ->
+/// `file:///C:/My%20Docs/%C3%A9.pdf`). Windows UNC paths (`\\server\share`) keep their host.
+pub fn file_uri(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let (prefix, rest) = match text.strip_prefix("//") {
+        Some(unc) => ("file://", unc.to_string()),
+        None => ("file:///", text.trim_start_matches('/').to_string()),
+    };
+    let mut uri = String::from(prefix);
+    for byte in rest.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            uri.push(byte as char);
+        } else {
+            write!(uri, "%{byte:02X}").unwrap();
+        }
+    }
+    uri
 }
 
 pub fn render(results: &[SearchResult], format: OutputFormat, style: Style, working_directory: &Path) -> String {
     match format {
         OutputFormat::Text => render_text(results, style, working_directory),
-        OutputFormat::FilesWithMatches => render_files(results, working_directory),
+        OutputFormat::FilesWithMatches => render_files(results, style, working_directory),
         OutputFormat::Json => serde_json::to_string_pretty(results).expect("search results always serialize") + "\n",
     }
 }
@@ -47,7 +76,7 @@ fn render_text(results: &[SearchResult], style: Style, working_directory: &Path)
             output.push('\n');
         }
         // Colors follow ripgrep: magenta paths, green line numbers.
-        let path = style.paint("35", &display_path(&result.path, working_directory));
+        let path = style.link(&result.path, &style.paint("35", &display_path(&result.path, working_directory)));
         let similarity = style.paint("2", &format!("{:.2}", result.similarity));
         match &result.content {
             ResultContent::Text { start_line, end_line, text } => {
@@ -95,13 +124,13 @@ fn image_label(path: &Path) -> String {
     }
 }
 
-fn render_files(results: &[SearchResult], working_directory: &Path) -> String {
+fn render_files(results: &[SearchResult], style: Style, working_directory: &Path) -> String {
     let mut seen: Vec<&PathBuf> = Vec::new();
     let mut output = String::new();
     for result in results {
         if !seen.contains(&&result.path) {
             seen.push(&result.path);
-            writeln!(output, "{}", display_path(&result.path, working_directory)).unwrap();
+            writeln!(output, "{}", style.link(&result.path, &display_path(&result.path, working_directory))).unwrap();
         }
     }
     output
@@ -166,7 +195,7 @@ mod tests {
             SearchResult { path: photo, similarity: 0.73, content: ResultContent::Image },
             SearchResult { path: directory.path().join("gone.jpg"), similarity: 0.5, content: ResultContent::Image },
         ];
-        let output = render(&results, OutputFormat::Text, Style { color: false }, directory.path());
+        let output = render(&results, OutputFormat::Text, Style::PLAIN, directory.path());
         assert_eq!(output, "beach.png  0.73  [image 120x80]\n\ngone.jpg  0.50  [image]\n");
     }
 
@@ -182,13 +211,32 @@ mod tests {
                 text: "4. Termination\nTwo months' notice.".into(),
             },
         }];
-        let output = render(&results, OutputFormat::Text, Style { color: false }, &working_directory());
+        let output = render(&results, OutputFormat::Text, Style::PLAIN, &working_directory());
         assert_eq!(output, "lease.pdf  page 3  0.81\n    4. Termination\n    Two months' notice.\n");
         let json: serde_json::Value =
-            serde_json::from_str(&render(&results, OutputFormat::Json, Style { color: false }, &working_directory()))
-                .unwrap();
+            serde_json::from_str(&render(&results, OutputFormat::Json, Style::PLAIN, &working_directory())).unwrap();
         assert_eq!((json[0]["kind"].as_str(), json[0]["page"].as_u64()), (Some("pdf"), Some(3)));
         assert!(json[0].get("start_line").is_none(), "lines within a PDF page are internal");
+    }
+
+    #[test]
+    fn hyperlinks_wrap_the_path_and_leave_the_text_unchanged() {
+        let path = working_directory().join("notes.txt");
+        let results = [result(path.to_str().unwrap(), 1, "hello")];
+        let style = Style { color: false, hyperlinks: true };
+        let output = render(&results, OutputFormat::FilesWithMatches, style, &working_directory());
+        let uri = file_uri(&path);
+        assert_eq!(output, format!("\x1b]8;;{uri}\x1b\\notes.txt\x1b]8;;\x1b\\\n"));
+    }
+
+    #[test]
+    fn file_uris_percent_encode_spaces_and_non_ascii() {
+        assert_eq!(
+            file_uri(Path::new(r"C:\Users\Ana María\My Docs\plan #2.pdf")),
+            "file:///C:/Users/Ana%20Mar%C3%ADa/My%20Docs/plan%20%232.pdf"
+        );
+        assert_eq!(file_uri(Path::new("/home/ana/notes.md")), "file:///home/ana/notes.md");
+        assert_eq!(file_uri(Path::new(r"\\server\share\a.txt")), "file://server/share/a.txt");
     }
 
     #[test]
@@ -198,8 +246,7 @@ mod tests {
             SearchResult { path: PathBuf::from("b.jpg"), similarity: 0.5, content: ResultContent::Image },
         ];
         let json: serde_json::Value =
-            serde_json::from_str(&render(&results, OutputFormat::Json, Style { color: false }, &working_directory()))
-                .unwrap();
+            serde_json::from_str(&render(&results, OutputFormat::Json, Style::PLAIN, &working_directory())).unwrap();
         assert_eq!(json[0]["kind"], "text");
         assert_eq!(json[0]["start_line"], 1);
         assert_eq!(json[1]["kind"], "image");
@@ -217,7 +264,7 @@ mod tests {
             result(path.to_str().unwrap(), 9, "    fn main() {\n\n        run();\n    }"),
             result("other.txt", 1, "note"),
         ];
-        let output = render(&results, OutputFormat::Text, Style { color: false }, &working_directory());
+        let output = render(&results, OutputFormat::Text, Style::PLAIN, &working_directory());
         let expected_path = Path::new("src").join("main.rs");
         let expected = format!(
             "{}:9-12  0.50\n 9: fn main() {{\n10:\n11:     run();\n12: }}\n\nother.txt:1-1  0.50\n1: note\n",
@@ -229,7 +276,7 @@ mod tests {
     #[test]
     fn files_with_matches_lists_each_file_once_in_rank_order() {
         let results = [result("b.txt", 1, "x"), result("a.txt", 1, "y"), result("b.txt", 9, "z")];
-        let output = render(&results, OutputFormat::FilesWithMatches, Style { color: false }, &working_directory());
+        let output = render(&results, OutputFormat::FilesWithMatches, Style::PLAIN, &working_directory());
         assert_eq!(output, "b.txt\na.txt\n");
     }
 

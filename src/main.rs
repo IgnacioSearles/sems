@@ -58,9 +58,44 @@ struct SearchArguments {
     /// Show weak results too, instead of only those that stand out from the rest of the index
     #[arg(long)]
     all: bool,
+    /// Make result paths clickable links (auto: when the terminal is known to support them)
+    #[arg(long, value_enum, env = "SEMS_HYPERLINKS", default_value = "auto")]
+    hyperlinks: HyperlinkMode,
     /// Only return this kind of content
     #[arg(long, value_enum)]
     kind: Option<KindFilter>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HyperlinkMode {
+    Auto,
+    Always,
+    Never,
+}
+
+impl HyperlinkMode {
+    fn enabled(self, stdout_is_terminal: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => stdout_is_terminal && terminal_supports_hyperlinks(),
+        }
+    }
+}
+
+/// OSC 8 hyperlinks are ignored by many terminals but printed as garbage by some (old conhost, some
+/// multiplexers), so `auto` only enables them for terminals that identify themselves as supporting
+/// them. `--hyperlinks always` covers the rest.
+fn terminal_supports_hyperlinks() -> bool {
+    let set = |name: &str| std::env::var_os(name).is_some();
+    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let vte_version: u32 = std::env::var("VTE_VERSION").ok().and_then(|version| version.parse().ok()).unwrap_or(0);
+    set("WT_SESSION") // Windows Terminal
+        || set("KITTY_WINDOW_ID")
+        || set("WEZTERM_EXECUTABLE")
+        || set("KONSOLE_VERSION")
+        || matches!(term_program.as_str(), "vscode" | "iTerm.app" | "WezTerm" | "ghostty")
+        || vte_version >= 5_000 // GNOME Terminal, Tilix, and other VTE terminals
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -237,7 +272,8 @@ fn run_search(arguments: &SearchArguments, locations: &Locations) -> Result<()> 
     } else {
         OutputFormat::Text
     };
-    let style = Style { color: std::io::stdout().is_terminal() };
+    let stdout_is_terminal = std::io::stdout().is_terminal();
+    let style = Style { color: stdout_is_terminal, hyperlinks: arguments.hyperlinks.enabled(stdout_is_terminal) };
     let working_directory = std::env::current_dir()?;
     write_stdout(&render(&results, format, style, &working_directory))
 }

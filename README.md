@@ -60,6 +60,7 @@ sems <QUERY> [PATH]           search under PATH (default: current directory)
         --json                full results as JSON (with a "kind" per result), for scripts and agents
         --kind <text|image|pdf>   only return this kind of content
         --all                 also show weak results (see below)
+        --hyperlinks <auto|always|never>   clickable paths (default auto)
 sems index [PATH]             index or incrementally update PATH
         --device <auto|cpu|cuda|directml>   (default auto)
         --skip-images         leave images out (see below)
@@ -80,6 +81,11 @@ Searches show only results that stand out: when the similarity curve has a cliff
 matches, everything below it is dropped, so a question with one answer gets one result. A smooth
 curve (many related chunks) is not cut; exact keyword matches always stay; `--all` disables the
 cutoff. On the labelled corpus a search returns 2.5 results on average and never hides the answer.
+
+Result paths are clickable (OSC 8 hyperlinks; Ctrl+click in Windows Terminal) and open the file
+in its default application. `auto` enables them only in terminals known to support them (Windows
+Terminal, VS Code, WezTerm, iTerm2, kitty, Konsole, GNOME Terminal and other VTE terminals); use
+`--hyperlinks always` elsewhere, or set `SEMS_HYPERLINKS`.
 
 Searches always run on the CPU (~1.2 s including model load). Indexing picks the fastest device
 that works (`--device auto`): CUDA when the CUDA pack is installed and the NVIDIA driver supports
