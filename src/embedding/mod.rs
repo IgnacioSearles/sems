@@ -14,7 +14,7 @@ use image::DynamicImage;
 use tokenizers::Tokenizer;
 
 pub use config::ModelConfig;
-pub use image_preprocessing::{ImagePreprocessor, PreprocessedImage};
+pub use image_preprocessing::{ImagePreprocessor, PreprocessedImage, SUPPORTED_VISION_TOKEN_BUDGETS};
 pub use onnx::{ExecutionDevice, OnnxRuntime};
 use onnx::{GraphSession, TensorF32};
 
@@ -95,6 +95,12 @@ impl EmbeddingModel {
         })
     }
 
+    /// Sets how many soft tokens each image is reduced to (see [`SUPPORTED_VISION_TOKEN_BUDGETS`]).
+    pub fn set_vision_token_budget(&mut self, max_soft_tokens: usize) -> Result<(), EmbeddingError> {
+        self.image_preprocessor = ImagePreprocessor::with_token_budget(&self.config.vision_config, max_soft_tokens)?;
+        Ok(())
+    }
+
     pub fn config(&self) -> &ModelConfig {
         &self.config
     }
@@ -121,18 +127,43 @@ impl EmbeddingModel {
     }
 
     pub fn embed_image(&mut self, image: &DynamicImage) -> Result<Embedding, EmbeddingError> {
-        let preprocessed = self.image_preprocessor.preprocess(image)?;
-        self.embed_preprocessed_image(&preprocessed)
+        Ok(self.embed_images(std::slice::from_ref(image))?.remove(0))
+    }
+
+    /// Embeds images in one inference call. Preprocessing (resize, patchify) runs on one thread
+    /// per image; batching amortizes per-call overhead and keeps a GPU busy.
+    pub fn embed_images(&mut self, images: &[DynamicImage]) -> Result<Vec<Embedding>, EmbeddingError> {
+        let preprocessor = &self.image_preprocessor;
+        let preprocessed: Vec<PreprocessedImage> = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                images.iter().map(|image| scope.spawn(move || preprocessor.preprocess(image))).collect();
+            handles.into_iter().map(join_propagating_panic).collect::<Result<_, _>>()
+        })?;
+        self.embed_preprocessed_images(&preprocessed)
     }
 
     /// Exposed separately so tests can feed reference preprocessing and isolate the model stages.
     pub fn embed_preprocessed_image(&mut self, image: &PreprocessedImage) -> Result<Embedding, EmbeddingError> {
-        let token_ids = self.image_token_ids(image.soft_token_count);
-        let batch = PaddedBatch::new(std::slice::from_ref(&token_ids), self.config.text_config.pad_token_id);
+        Ok(self.embed_preprocessed_images(std::slice::from_ref(image))?.remove(0))
+    }
+
+    /// Batched form of [`Self::embed_preprocessed_image`]. Rows of the padded text batch hold one
+    /// image each; row-major, their placeholders appear in image order, which is also the order of
+    /// the vision encoder's flattened soft tokens, so one splice fills the whole batch.
+    pub fn embed_preprocessed_images(
+        &mut self,
+        images: &[PreprocessedImage],
+    ) -> Result<Vec<Embedding>, EmbeddingError> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sequences: Vec<Vec<i64>> =
+            images.iter().map(|image| self.image_token_ids(image.soft_token_count)).collect();
+        let batch = PaddedBatch::new(&sequences, self.config.text_config.pad_token_id);
         let mut inputs_embeds = self.embed_tokens(&batch)?;
-        let soft_tokens = self.encode_vision(image)?;
-        splice_soft_tokens(&mut inputs_embeds, &token_ids, self.config.image_token_id, &soft_tokens)?;
-        Ok(self.encode(inputs_embeds, &batch)?.remove(0))
+        let soft_tokens = self.encode_vision(images)?;
+        splice_soft_tokens(&mut inputs_embeds, &batch.token_ids, self.config.image_token_id, &soft_tokens)?;
+        self.encode(inputs_embeds, &batch)
     }
 
     /// `[BOS] [BOI] <image>×n [EOI] [EOS]`, exactly as the upstream processor builds it.
@@ -158,21 +189,28 @@ impl EmbeddingModel {
         self.token_embedder.run_single(vec![("input_ids", input_ids)], "inputs_embeds")
     }
 
-    fn encode_vision(&mut self, image: &PreprocessedImage) -> Result<TensorF32, EmbeddingError> {
+    /// Runs the vision encoder over a batch; returns every image's soft tokens, flattened in order.
+    fn encode_vision(&mut self, images: &[PreprocessedImage]) -> Result<TensorF32, EmbeddingError> {
+        let (max_patches, patch_pixels) = (images[0].max_patches, images[0].patch_pixels);
+        if images.iter().any(|image| image.max_patches != max_patches || image.patch_pixels != patch_pixels) {
+            return Err(EmbeddingError::InvalidImage("images in one batch must share a patch budget".into()));
+        }
         if self.vision_encoder.is_none() {
             let path = self.files.path("vision_encoder.onnx");
             self.vision_encoder = Some(GraphSession::load(self.runtime, "vision_encoder", &path, self.device)?);
         }
         let vision_encoder = self.vision_encoder.as_mut().expect("vision encoder was loaded above");
-        let pixel_values =
-            onnx::tensor_f32(vec![1, image.max_patches, image.patch_pixels], image.pixel_values.clone())?;
-        let position_ids = onnx::tensor_i64(vec![1, image.max_patches, 2], image.position_ids.clone())?;
+        let pixel_values: Vec<f32> = images.iter().flat_map(|image| image.pixel_values.iter().copied()).collect();
+        let position_ids: Vec<i64> = images.iter().flat_map(|image| image.position_ids.iter().copied()).collect();
+        let pixel_values = onnx::tensor_f32(vec![images.len(), max_patches, patch_pixels], pixel_values)?;
+        let position_ids = onnx::tensor_i64(vec![images.len(), max_patches, 2], position_ids)?;
         let soft_tokens = vision_encoder
             .run_single(vec![("pixel_values", pixel_values), ("position_ids", position_ids)], "soft_tokens")?;
-        if soft_tokens.shape.first() != Some(&image.soft_token_count) {
+        let expected: usize = images.iter().map(|image| image.soft_token_count).sum();
+        if soft_tokens.shape.first() != Some(&expected) {
             return Err(EmbeddingError::UnexpectedOutput {
                 graph: "vision_encoder",
-                message: format!("expected {} soft tokens, got shape {:?}", image.soft_token_count, soft_tokens.shape),
+                message: format!("expected {expected} soft tokens, got shape {:?}", soft_tokens.shape),
             });
         }
         Ok(soft_tokens)

@@ -36,13 +36,28 @@ pub struct ImagePreprocessor {
     max_patches: usize,
 }
 
+/// Vision token budgets the model supports (`Gemma4ImageProcessor._SUPPORTED_SOFT_TOKENS`).
+pub const SUPPORTED_VISION_TOKEN_BUDGETS: [usize; 5] = [70, 140, 280, 560, 1120];
+
 impl ImagePreprocessor {
+    /// Uses the model's default budget (280 soft tokens per image).
     pub fn new(config: &VisionConfig) -> Self {
-        Self {
+        Self::with_token_budget(config, config.max_soft_tokens).expect("the model's default budget is supported")
+    }
+
+    /// Fewer tokens per image means fewer patches, and vision attention cost grows with the
+    /// square of the patch count, so the budget is the main speed/quality lever for images.
+    pub fn with_token_budget(config: &VisionConfig, max_soft_tokens: usize) -> Result<Self, EmbeddingError> {
+        if !SUPPORTED_VISION_TOKEN_BUDGETS.contains(&max_soft_tokens) {
+            return Err(EmbeddingError::InvalidImage(format!(
+                "unsupported vision token budget {max_soft_tokens} (expected one of {SUPPORTED_VISION_TOKEN_BUDGETS:?})"
+            )));
+        }
+        Ok(Self {
             patch_size: config.patch_size,
             pooling_kernel_size: config.pooling_kernel_size,
-            max_patches: config.max_soft_tokens * config.pooling_kernel_size.pow(2),
-        }
+            max_patches: max_soft_tokens * config.pooling_kernel_size.pow(2),
+        })
     }
 
     pub fn preprocess(&self, image: &DynamicImage) -> Result<PreprocessedImage, EmbeddingError> {

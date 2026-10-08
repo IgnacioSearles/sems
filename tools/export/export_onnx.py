@@ -32,6 +32,8 @@ from sentence_transformers import SentenceTransformer
 from torch import nn
 
 MINIMUM_COSINE_SIMILARITY = 0.9999
+# Smaller vision token budgets than the default 280 that the runtime may use; verified explicitly.
+ALTERNATIVE_VISION_TOKEN_BUDGETS = (140, 70)
 ONNX_OPSET = 20
 # Non-graph files the Rust runtime reads from the model directory.
 RUNTIME_FILES = ("tokenizer.json", "config.json")
@@ -96,6 +98,62 @@ class Pipeline:
                 raise ValueError(f"{int(image_positions.sum())} placeholders but {soft_tokens.shape[0]} soft tokens")
             inputs_embeds[image_positions] = soft_tokens
         return self.encode_text(inputs_embeds, features["attention_mask"])
+
+
+def make_pooler_exportable(pooling_kernel_size: int) -> None:
+    """Replaces Gemma4VisionPooler's pooling with an equivalent that keeps the patch count symbolic.
+
+    Upstream derives the kernel size with `int(sqrt(patches // length))` and pools with
+    `F.one_hot(..., length)`; both need concrete integers, so torch.export silently fixed the patch
+    dimension to the traced 2520 and every other vision token budget failed at runtime. The kernel
+    size is a model constant, and one_hot is an equality test against `arange(length)`. Callers
+    verify equivalence against references computed with the unpatched code.
+    """
+    from transformers.models.gemma4 import modeling_gemma4
+
+    def avg_pool_by_positions(self, hidden_states, pixel_position_ids, length):
+        clamped_positions = pixel_position_ids.clamp(min=0)
+        max_x = clamped_positions[..., 0].max(dim=-1, keepdim=True)[0] + 1
+        kernel_idxs = torch.div(clamped_positions, pooling_kernel_size, rounding_mode="floor")
+        kernel_idxs = kernel_idxs[..., 0] + (max_x // pooling_kernel_size) * kernel_idxs[..., 1]
+        slots = torch.arange(length, device=kernel_idxs.device)
+        weights = (kernel_idxs.unsqueeze(-1) == slots).float() / pooling_kernel_size**2
+        output = weights.transpose(1, 2) @ hidden_states.float()
+        mask = torch.logical_not((weights == 0).all(dim=1))
+        return output.to(hidden_states.dtype), mask
+
+    def forward(self, hidden_states, pixel_position_ids, padding_positions, output_length=None):
+        # Upstream's size checks branch on the patch count; output_length < patches always holds here.
+        hidden_states = hidden_states.masked_fill(padding_positions.unsqueeze(-1), 0.0)
+        hidden_states, padding_positions = self._avg_pool_by_positions(hidden_states, pixel_position_ids, output_length)
+        return hidden_states.float() * self.root_hidden_size, padding_positions
+
+    modeling_gemma4.Gemma4VisionPooler._avg_pool_by_positions = avg_pool_by_positions
+    modeling_gemma4.Gemma4VisionPooler.forward = forward
+
+
+def budget_reference_cases(model: SentenceTransformer, image_path: Path) -> list[dict]:
+    """Image cases at non-default token budgets, embedded by the official (unpatched) model."""
+    backbone = model[0].model
+    config = backbone.config
+    image = Image.open(image_path).convert("RGB")
+    cases = []
+    for budget in ALTERNATIVE_VISION_TOKEN_BUDGETS:
+        processed = model[0].processor(text=["<|image|>"], images=[image], return_tensors="pt", max_soft_tokens=budget)
+        soft_tokens = int((processed["input_ids"] == config.image_token_id).sum())
+        ids = [config.text_config.bos_token_id, config.boi_token_id] + [config.image_token_id] * soft_tokens
+        ids += [config.eoi_token_id, config.text_config.eos_token_id]
+        features = {
+            "input_ids": torch.tensor([ids]),
+            "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+            "pixel_values": processed["pixel_values"],
+            "image_position_ids": processed["image_position_ids"],
+        }
+        with torch.no_grad():
+            hidden = backbone(**features).last_hidden_state
+        expected = torch.nn.functional.normalize(hidden.mean(dim=1), dim=-1)[0].numpy()
+        cases.append({"features": features, "expected": expected})
+    return cases
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -282,15 +340,20 @@ def main() -> None:
     image_token_id = model[0].model.config.image_token_id
     references = json.loads(arguments.reference.read_text(encoding="utf-8"))
     cases = preprocess_reference_inputs(model, references, arguments.image)
+    # References first, with the official pooler; the patch below must reproduce them exactly.
+    budget_cases = budget_reference_cases(model, arguments.image)
+    make_pooler_exportable(model[0].model.config.vision_config.pooling_kernel_size)
     modules = build_modules(model)
 
     verify(torch_pipeline(modules, image_token_id), cases, "torch decomposition")
+    verify(torch_pipeline(modules, image_token_id), budget_cases, "torch decomposition, other token budgets")
     image_case = next(case for case in cases if "pixel_values" in case["features"])
     export_all(modules, image_case["features"], arguments.out)
     for file_name in RUNTIME_FILES:
         shutil.copy2(arguments.model / file_name, arguments.out / file_name)
     exported = onnx_pipeline(arguments.out, image_token_id)
     verify(exported, cases, "onnx runtime")
+    verify(exported, budget_cases, "onnx runtime, other token budgets")
     verify_generalization(model, exported)
 
 

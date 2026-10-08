@@ -16,6 +16,8 @@ fast_image_resize = { version = "6.1", features = ["image"] }
 # ripgrep's walker: .gitignore handling and hidden-file rules users already expect.
 ignore = "0.4"
 image = "0.25"
+# Probes the CUDA driver through the CUDA pack before choosing a runtime (already used by ort).
+libloading = "0.9"
 # ort 2.x has not had a stable release yet; pin the exact release candidate.
 # load-dynamic: onnxruntime.dll is loaded from an explicit path at runtime. Static linking needs the
 # VS 2022 STL, and loading by name on Windows can pick up the outdated copy in System32.

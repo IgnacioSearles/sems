@@ -1635,6 +1635,7 @@ dependencies = [
  "fast_image_resize",
  "ignore",
  "image",
+ "libloading",
  "ort",
  "rusqlite",
  "serde",

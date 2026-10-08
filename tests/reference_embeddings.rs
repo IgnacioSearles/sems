@@ -165,3 +165,24 @@ fn image_embedding_matches_reference_end_to_end() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires exported model and SEMS_ONNXRUNTIME"]
+fn batched_images_match_individual_embeddings() {
+    let mut model = load_model();
+    let reference = load_references("image").remove(0);
+    let image_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/images").join(&reference.input);
+    let beach = image::open(image_path).unwrap();
+    // Different aspect ratios give different soft-token counts, so the batch needs padding.
+    let portrait = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(300, 800, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+    }));
+    let images = [beach.clone(), portrait.clone(), beach];
+
+    let batched = model.embed_images(&images).unwrap();
+    for (index, image) in images.iter().enumerate() {
+        let single = model.embed_image(image).unwrap();
+        assert_matches_reference(&format!("batch item {index} vs single"), &batched[index], &single);
+    }
+    assert_matches_reference("batched beach vs reference", &batched[0], &reference.embedding);
+}

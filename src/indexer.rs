@@ -205,6 +205,13 @@ fn store_text_group(
     Ok(())
 }
 
+/// Embeds images one at a time while a background thread decodes the next ones.
+///
+/// Decoding a 12 MP JPEG takes ~50 ms, embedding ~270 ms on CUDA, so overlapping them hides the
+/// decode; the bounded queue caps how many full-resolution photos are in memory at once. Images
+/// are not batched: on a 4 GB GPU a batch of 2 was 3x slower per image (each vision layer already
+/// materializes a large attention matrix) and a batch of 8 ran out of memory.
+///
 /// An undecodable image (corrupt, truncated, unsupported variant) is skipped and counted rather
 /// than aborting the run: one bad download should not block indexing a photo library.
 fn embed_images(
@@ -214,28 +221,42 @@ fn embed_images(
     progress: &mut dyn IndexProgress,
     summary: &mut IndexSummary,
 ) -> Result<()> {
-    for file in pending {
-        match load_image(&file.path) {
-            Ok(LoadedImage::Image(image)) => {
-                let embedding =
-                    encoder.encode_image(&image).with_context(|| format!("failed to embed {}", file.path.display()))?;
-                store.replace_image_file(&file.path, &file.record, &embedding)?;
-                summary.files_embedded += 1;
-                summary.images_embedded += 1;
-                summary.chunks_embedded += 1;
-                progress.files_embedded(summary.files_embedded, summary.chunks_embedded);
+    const DECODED_IMAGES_AHEAD: usize = 2;
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(DECODED_IMAGES_AHEAD);
+        scope.spawn(move || {
+            for file in pending {
+                let loaded = load_image(&file.path);
+                // A send error means embedding stopped with an error; stop decoding too.
+                if sender.send((file, loaded)).is_err() {
+                    break;
+                }
             }
-            Ok(LoadedImage::TooSmall) => {
-                store.record_skipped_file(&file.path, &file.record)?;
-                summary.images_skipped_too_small += 1;
-            }
-            Err(_) => {
-                store.record_skipped_file(&file.path, &file.record)?;
-                summary.images_unreadable += 1;
+        });
+        for (file, loaded) in receiver {
+            match loaded {
+                Ok(LoadedImage::Image(image)) => {
+                    let embedding = encoder
+                        .encode_image(&image)
+                        .with_context(|| format!("failed to embed {}", file.path.display()))?;
+                    store.replace_image_file(&file.path, &file.record, &embedding)?;
+                    summary.files_embedded += 1;
+                    summary.images_embedded += 1;
+                    summary.chunks_embedded += 1;
+                    progress.files_embedded(summary.files_embedded, summary.chunks_embedded);
+                }
+                Ok(LoadedImage::TooSmall) => {
+                    store.record_skipped_file(&file.path, &file.record)?;
+                    summary.images_skipped_too_small += 1;
+                }
+                Err(_) => {
+                    store.record_skipped_file(&file.path, &file.record)?;
+                    summary.images_unreadable += 1;
+                }
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The model card recommends the file name as the document title for code retrieval.

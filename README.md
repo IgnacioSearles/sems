@@ -3,8 +3,8 @@
 Semantic search for local files — like `grep`, but it matches meaning instead of exact text.
 
 ```console
-> sems index --device cuda
-indexed C:\...\sems: 46 files (0 unchanged, 45 embedded into 711 chunks, 0 removed, skipped 1 binary) in 14.1s [256d]
+> sems index
+indexed C:\...\sems: 61 files (0 unchanged, 61 embedded (11 images) into 796 chunks, 0 removed) in 20.3s [cuda, 256d]
 
 > sems -n 1 "how is the dll search path set for cudnn"
 src\embedding\onnx.rs:46-67  0.82
@@ -49,7 +49,7 @@ sems <QUERY> [PATH]           search under PATH (default: current directory)
         --json                full results as JSON (with a "kind" per result), for scripts and agents
         --kind <text|image>   only return this kind of content
 sems index [PATH]             index or incrementally update PATH
-        --device <cpu|cuda|directml>
+        --device <auto|cpu|cuda|directml>   (default auto)
         --skip-images         leave images out (see below)
         --rebuild             discard the index and start over
 sems status [PATH]            what is indexed under PATH
@@ -64,10 +64,16 @@ according to their EXIF orientation. Images under 64 px on a side are skipped as
 images share one ranking: the model scores a photo query highest against the right photo and a
 text query highest against text, so no `--kind` is needed to keep them apart.
 
-Searches always run on the CPU (~1.2 s including model load). `--device` speeds up indexing:
-roughly 3x with DirectML and 11x with CUDA compared to CPU on an RTX 3050 Ti. Images cost about
-5 s each on a CPU and well under a second with CUDA, so index photo folders with a GPU, or pass
-`--skip-images` for code repositories on CPU-only machines.
+Searches always run on the CPU (~1.2 s including model load). Indexing picks the fastest device
+that works (`--device auto`): CUDA when the CUDA pack is installed and the NVIDIA driver supports
+it, otherwise DirectML on the high-performance GPU, otherwise the CPU. The summary line names the
+device used. On an RTX 3050 Ti, text indexes about 11x faster with CUDA and 3x with DirectML than on
+the CPU; a 12-megapixel photo takes about 0.3 s with CUDA and 2 s on the CPU. Pass
+`--skip-images` to leave images out of code repositories on CPU-only machines.
+
+Images are reduced to 140 vision tokens rather than the model's default 280: about 2.3x faster on
+CUDA and 2.6x on the CPU with no loss on the search-quality corpus. The budget is part of the index
+identity, so changing it requires `sems index --rebuild`.
 
 ## Setup (development)
 
@@ -76,7 +82,7 @@ sems keeps everything under `%LOCALAPPDATA%\sems` (`<local data dir>/sems` elsew
 ```text
 model\                 exported EmbeddingGemma 2 graphs, tokenizer and config
 runtime\directml\      default ONNX Runtime (~40 MB); also serves CPU, so searches use it
-runtime\cuda\          optional CUDA pack (~900 MB), used by `sems index --device cuda`
+runtime\cuda\          optional CUDA pack (~900 MB), preferred by `sems index` when the driver supports it
 index.db               the index
 ```
 
@@ -106,7 +112,7 @@ Every location can be overridden (flags win over environment variables):
 | Model directory | `--model-dir` | `SEMS_MODEL_DIR` |
 | ONNX Runtime library (any 1.24+ build) | `--onnxruntime` | `SEMS_ONNXRUNTIME` |
 | Index database | `--index` | `SEMS_INDEX` |
-| Indexing device (`cpu`, `cuda`, `directml`) | `--device` | `SEMS_DEVICE` |
+| Indexing device (`auto`, `cpu`, `cuda`, `directml`) | `--device` | `SEMS_DEVICE` |
 
 sems always loads ONNX Runtime by explicit path: Windows ships an outdated `onnxruntime.dll` in
 System32 that loading by name could pick up.

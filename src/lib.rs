@@ -1,4 +1,5 @@
 pub mod chunking;
+pub mod device;
 pub mod discovery;
 pub mod embedding;
 pub mod encoder;

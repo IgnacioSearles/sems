@@ -40,18 +40,25 @@ pub struct GemmaEncoderConfig {
     pub padded_token_budget: usize,
     /// Longest document sequence; chunking keeps real chunks far below this.
     pub max_sequence_tokens: usize,
+    /// Soft tokens per image. Changes image embeddings, so it is part of the index identity.
+    ///
+    /// 140 rather than the model's default 280: vision attention cost grows with the square of the
+    /// patch count, so it embeds 2.3x faster on CUDA (616 -> 271 ms) and 2.6x on CPU, with no loss
+    /// measured by search_quality (recall 1.00, margins 0.104 vs 0.102). Larger budgets keep finer
+    /// detail (small objects, text in screenshots), which that corpus does not exercise.
+    pub vision_token_budget: usize,
 }
 
 impl GemmaEncoderConfig {
     /// Available without loading the model, so commands like `status` can open the index cheaply.
     pub fn identity(&self) -> String {
-        format!("{MODEL_NAME}@{}", self.dimensions)
+        format!("{MODEL_NAME}@{}/vision{}", self.dimensions, self.vision_token_budget)
     }
 }
 
 impl Default for GemmaEncoderConfig {
     fn default() -> Self {
-        Self { dimensions: 256, padded_token_budget: 2_400, max_sequence_tokens: 2_048 }
+        Self { dimensions: 256, padded_token_budget: 2_400, max_sequence_tokens: 2_048, vision_token_budget: 140 }
     }
 }
 
@@ -61,13 +68,14 @@ pub struct GemmaEncoder {
 }
 
 impl GemmaEncoder {
-    pub fn new(model: EmbeddingModel, config: GemmaEncoderConfig) -> Result<Self> {
+    pub fn new(mut model: EmbeddingModel, config: GemmaEncoderConfig) -> Result<Self> {
         ensure!(
             SUPPORTED_DIMENSIONS.contains(&config.dimensions),
             "unsupported embedding dimensions {} (expected one of {SUPPORTED_DIMENSIONS:?})",
             config.dimensions
         );
         ensure!(config.max_sequence_tokens >= 2, "max_sequence_tokens must leave room for BOS and EOS");
+        model.set_vision_token_budget(config.vision_token_budget)?;
         Ok(Self { model, config })
     }
 }

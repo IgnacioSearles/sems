@@ -9,6 +9,10 @@
 //! - localization: does the top result contain the right line? (`eval_localization.json`)
 //! - images: does a text description rank the right photo first, among text and other photos?
 //!   (`eval_images.json`; photo file names are generic, so only pixels can answer)
+//!
+//! Recall saturates on a corpus this small, so image queries also report the similarity margin:
+//! the right photo's score minus the best other result's. It shrinks before rankings break.
+//! Set SEMS_EVAL_VISION_BUDGETS=280,140,70 to compare vision token budgets.
 
 use std::path::{Path, PathBuf};
 
@@ -69,6 +73,25 @@ impl Evaluation {
         self.relative_path(result) == labelled.expected && line_matches
     }
 
+    /// Mean and smallest gap between the expected result's similarity and the best other result's.
+    fn margins(&mut self, queries: &[LabelledQuery]) -> (f32, f32) {
+        let scope = PathScope::new(&self.corpus);
+        let options = SearchOptions { limit: 20, one_result_per_file: true, ..SearchOptions::default() };
+        let margins: Vec<f32> = queries
+            .iter()
+            .map(|labelled| {
+                let results = search(&self.store, &mut self.encoder, &scope, &labelled.query, options).unwrap();
+                let (expected, others): (Vec<&SearchResult>, Vec<&SearchResult>) =
+                    results.iter().partition(|result| self.relative_path(result) == labelled.expected);
+                let expected = expected.first().map_or(-1.0, |result| result.similarity);
+                let best_other = others.iter().map(|result| result.similarity).fold(-1.0, f32::max);
+                expected - best_other
+            })
+            .collect();
+        let mean = margins.iter().sum::<f32>() / margins.len() as f32;
+        (mean, margins.iter().copied().fold(f32::INFINITY, f32::min))
+    }
+
     /// Fraction of queries whose top result is the expected file (and line, if labelled).
     fn score(&mut self, label: &str, queries: &[LabelledQuery], kind: Option<FileKind>) -> f32 {
         let mut misses = Vec::new();
@@ -97,12 +120,13 @@ fn load_queries(file_name: &str) -> Vec<LabelledQuery> {
     serde_json::from_str(&std::fs::read_to_string(fixtures().join(file_name)).unwrap()).unwrap()
 }
 
-fn build_evaluation() -> Evaluation {
+fn build_evaluation(vision_token_budget: usize) -> Evaluation {
     let library = std::env::var_os("SEMS_ONNXRUNTIME").expect("set SEMS_ONNXRUNTIME to the onnxruntime library path");
     let runtime = OnnxRuntime::load(Path::new(&library)).expect("failed to load ONNX Runtime");
     let model_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("models").join("onnx");
     let model = EmbeddingModel::load(runtime, &model_directory, ExecutionDevice::Cpu).expect("failed to load model");
-    let mut encoder = GemmaEncoder::new(model, GemmaEncoderConfig::default()).unwrap();
+    let config = GemmaEncoderConfig { vision_token_budget, ..GemmaEncoderConfig::default() };
+    let mut encoder = GemmaEncoder::new(model, config).unwrap();
 
     let identity = IndexIdentity {
         encoder: encoder.identity(),
@@ -117,18 +141,33 @@ fn build_evaluation() -> Evaluation {
     Evaluation { store, encoder, corpus }
 }
 
+fn budgets_to_evaluate() -> Vec<usize> {
+    match std::env::var("SEMS_EVAL_VISION_BUDGETS") {
+        Ok(list) => list.split(',').map(|budget| budget.trim().parse().expect("budgets are integers")).collect(),
+        Err(_) => vec![GemmaEncoderConfig::default().vision_token_budget],
+    }
+}
+
 #[test]
 #[ignore = "requires exported model and SEMS_ONNXRUNTIME"]
 fn retrieval_localization_and_images_meet_floor() {
-    let mut evaluation = build_evaluation();
-    let recall = evaluation.score("text retrieval recall@1", &load_queries("eval_queries.json"), None);
-    let located = evaluation.score("localization located@1", &load_queries("eval_localization.json"), None);
-    let images = load_queries("eval_images.json");
-    let image_recall = evaluation.score("image recall@1 (mixed with text)", &images, None);
-    let image_only_recall = evaluation.score("image recall@1 (--kind image)", &images, Some(FileKind::Image));
+    let default_budget = GemmaEncoderConfig::default().vision_token_budget;
+    for budget in budgets_to_evaluate() {
+        println!("=== vision token budget {budget}{}", if budget == default_budget { " [default]" } else { "" });
+        let mut evaluation = build_evaluation(budget);
+        let recall = evaluation.score("text retrieval recall@1", &load_queries("eval_queries.json"), None);
+        let located = evaluation.score("localization located@1", &load_queries("eval_localization.json"), None);
+        let images = load_queries("eval_images.json");
+        let image_recall = evaluation.score("image recall@1 (mixed with text)", &images, None);
+        let image_only_recall = evaluation.score("image recall@1 (--kind image)", &images, Some(FileKind::Image));
+        let (mean_margin, smallest_margin) = evaluation.margins(&images);
+        println!("{:<34} mean {mean_margin:.3}, smallest {smallest_margin:.3}", "image similarity margin");
 
-    assert!(recall >= MINIMUM_RECALL_AT_1, "text retrieval regressed: {recall:.2}");
-    assert!(located >= MINIMUM_LOCATED_AT_1, "localization regressed: {located:.2}");
-    assert!(image_recall >= MINIMUM_IMAGE_RECALL_AT_1, "image retrieval regressed: {image_recall:.2}");
-    assert!(image_only_recall >= image_recall, "filtering to images should never hurt: {image_only_recall:.2}");
+        if budget == default_budget {
+            assert!(recall >= MINIMUM_RECALL_AT_1, "text retrieval regressed: {recall:.2}");
+            assert!(located >= MINIMUM_LOCATED_AT_1, "localization regressed: {located:.2}");
+            assert!(image_recall >= MINIMUM_IMAGE_RECALL_AT_1, "image retrieval regressed: {image_recall:.2}");
+            assert!(image_only_recall >= image_recall, "filtering to images should never hurt");
+        }
+    }
 }

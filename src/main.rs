@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use sems::chunking::ChunkingConfig;
+use sems::device::{DeviceChoice, RuntimeLayout, cuda_driver_supports, plan_runtime};
 use sems::discovery::{DiscoveryOptions, FileKind};
 use sems::embedding::{EmbeddingModel, ExecutionDevice, OnnxRuntime};
 use sems::encoder::{Encoder, GemmaEncoder, GemmaEncoderConfig};
@@ -81,9 +82,10 @@ struct IndexArguments {
     /// Discard the whole index and rebuild this directory from scratch
     #[arg(long)]
     rebuild: bool,
-    /// Where to run the model while indexing. Searches always use the CPU, which starts faster.
-    #[arg(long, env = "SEMS_DEVICE", default_value = "cpu", value_parser = parse_device)]
-    device: ExecutionDevice,
+    /// Where to run the model while indexing: auto picks CUDA, then DirectML, then the CPU.
+    /// Searches always use the CPU, which starts faster.
+    #[arg(long, env = "SEMS_DEVICE", default_value = "auto", value_parser = parse_device_choice)]
+    device: DeviceChoice,
     /// Skip text files larger than this many bytes
     #[arg(long, default_value_t = 1024 * 1024)]
     max_file_size: u64,
@@ -109,31 +111,6 @@ struct Locations {
     onnxruntime: Option<PathBuf>,
 }
 
-/// ONNX Runtime builds sems knows how to find. Only one can be loaded per process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeFlavor {
-    /// Bundled default; its CPU provider also serves searches and CPU indexing.
-    DirectMl,
-    /// Optional download for fast indexing on NVIDIA GPUs.
-    Cuda,
-}
-
-impl RuntimeFlavor {
-    fn for_device(device: ExecutionDevice) -> Self {
-        match device {
-            ExecutionDevice::Cuda => Self::Cuda,
-            ExecutionDevice::Cpu | ExecutionDevice::DirectMl => Self::DirectMl,
-        }
-    }
-
-    fn directory_name(self) -> &'static str {
-        match self {
-            Self::DirectMl => "directml",
-            Self::Cuda => "cuda",
-        }
-    }
-}
-
 impl Locations {
     fn index_path(&self) -> Result<PathBuf> {
         match &self.index {
@@ -157,47 +134,20 @@ impl Locations {
         Ok(directory)
     }
 
-    /// An explicit `--onnxruntime` wins; otherwise the installed runtime for the device's flavor.
-    /// Release builds ship the DirectML runtime next to the executable; development setups install
-    /// runtimes under the data directory with tools/runtime/install_runtime.py.
-    fn onnxruntime_library(&self, device: ExecutionDevice) -> Result<PathBuf> {
-        if let Some(library) = &self.onnxruntime {
-            if !library.is_file() {
-                bail!("ONNX Runtime not found at {} (from --onnxruntime or SEMS_ONNXRUNTIME)", library.display());
-            }
-            return Ok(library.clone());
-        }
-        let flavor = RuntimeFlavor::for_device(device);
-        let mut candidates = Vec::new();
-        if flavor == RuntimeFlavor::DirectMl {
-            candidates.push(std::env::current_exe()?.with_file_name(ONNXRUNTIME_LIBRARY));
-        }
-        candidates.push(data_directory()?.join("runtime").join(flavor.directory_name()).join(ONNXRUNTIME_LIBRARY));
-        if let Some(found) = candidates.iter().find(|candidate| candidate.is_file()) {
-            return Ok(found.clone());
-        }
-        let searched: Vec<String> = candidates.iter().map(|candidate| candidate.display().to_string()).collect();
-        bail!(
-            "no {name} ONNX Runtime installed (looked for {}); install it with \
-             `python tools/runtime/install_runtime.py {name}` or set --onnxruntime",
-            searched.join(", "),
-            name = flavor.directory_name()
-        )
+    fn runtime_layout(&self) -> Result<RuntimeLayout> {
+        let executable = std::env::current_exe().context("cannot locate the sems executable")?;
+        Ok(RuntimeLayout {
+            executable_directory: executable.parent().context("executable has no directory")?.to_path_buf(),
+            runtimes_directory: data_directory()?.join("runtime"),
+        })
     }
 }
-
-#[cfg(windows)]
-const ONNXRUNTIME_LIBRARY: &str = "onnxruntime.dll";
-#[cfg(target_os = "macos")]
-const ONNXRUNTIME_LIBRARY: &str = "libonnxruntime.dylib";
-#[cfg(all(unix, not(target_os = "macos")))]
-const ONNXRUNTIME_LIBRARY: &str = "libonnxruntime.so";
 
 fn data_directory() -> Result<PathBuf> {
     Ok(dirs::data_local_dir().context("cannot determine the local data directory")?.join("sems"))
 }
 
-fn parse_device(value: &str) -> Result<ExecutionDevice, String> {
+fn parse_device_choice(value: &str) -> Result<DeviceChoice, String> {
     value.parse()
 }
 
@@ -226,10 +176,28 @@ fn index_identity() -> IndexIdentity {
     }
 }
 
-fn load_encoder(locations: &Locations, device: ExecutionDevice) -> Result<GemmaEncoder> {
-    let runtime = OnnxRuntime::load(&locations.onnxruntime_library(device)?)?;
-    let model = EmbeddingModel::load(runtime, &locations.model_directory()?, device)?;
-    GemmaEncoder::new(model, GemmaEncoderConfig::default())
+/// Loads the model on the first device in the plan that works, and reports which one it was.
+fn load_encoder(locations: &Locations, choice: DeviceChoice) -> Result<(GemmaEncoder, ExecutionDevice)> {
+    let model_directory = locations.model_directory()?;
+    let plan =
+        plan_runtime(choice, locations.onnxruntime.as_deref(), &locations.runtime_layout()?, &cuda_driver_supports)?;
+    let runtime = OnnxRuntime::load(&plan.library)?;
+    let mut failures = Vec::new();
+    for &device in &plan.devices {
+        match EmbeddingModel::load(runtime, &model_directory, device) {
+            Ok(model) => return Ok((GemmaEncoder::new(model, GemmaEncoderConfig::default())?, device)),
+            Err(error) => failures.push(format!("{}: {error}", device_name(device))),
+        }
+    }
+    bail!("could not load the model on any device ({})", failures.join("; "))
+}
+
+fn device_name(device: ExecutionDevice) -> &'static str {
+    match device {
+        ExecutionDevice::Cpu => "cpu",
+        ExecutionDevice::Cuda => "cuda",
+        ExecutionDevice::DirectMl => "directml",
+    }
 }
 
 /// Canonical form of a user-supplied path (defaulting to the working directory).
@@ -247,7 +215,7 @@ fn run_search(arguments: &SearchArguments, locations: &Locations) -> Result<()> 
         bail!("nothing is indexed under {}; run `sems index {}` first", root.display(), root.display());
     }
 
-    let mut encoder = load_encoder(locations, ExecutionDevice::Cpu)?;
+    let (mut encoder, _) = load_encoder(locations, DeviceChoice::Exactly(ExecutionDevice::Cpu))?;
     let options = SearchOptions {
         limit: arguments.limit,
         one_result_per_file: arguments.files_with_matches,
@@ -274,7 +242,7 @@ fn run_index(arguments: &IndexArguments, locations: &Locations) -> Result<()> {
         bail!("{} is not a directory", root.display());
     }
     // Load the model first: a missing runtime should fail before the index is created or cleared.
-    let mut encoder = load_encoder(locations, arguments.device)?;
+    let (mut encoder, device) = load_encoder(locations, arguments.device)?;
     let index_path = locations.index_path()?;
     let mut store = if arguments.rebuild {
         IndexStore::recreate(&index_path, index_identity())?
@@ -292,7 +260,7 @@ fn run_index(arguments: &IndexArguments, locations: &Locations) -> Result<()> {
     let mut progress = TerminalProgress::new();
     let summary = index_directory(&mut store, &mut encoder, &root, &options, &mut progress)?;
     progress.finish();
-    eprintln!("{}", summary_line(&root, &summary, encoder.dimensions()));
+    eprintln!("{}", summary_line(&root, &summary, encoder.dimensions(), device));
     Ok(())
 }
 
@@ -312,7 +280,7 @@ fn run_status(path: Option<&Path>, locations: &Locations) -> Result<()> {
     ))
 }
 
-fn summary_line(root: &Path, summary: &IndexSummary, dimensions: usize) -> String {
+fn summary_line(root: &Path, summary: &IndexSummary, dimensions: usize, device: ExecutionDevice) -> String {
     let skipped: Vec<String> = [
         (summary.files_skipped_binary, "binary"),
         (summary.files_skipped_too_large, "too large"),
@@ -327,7 +295,7 @@ fn summary_line(root: &Path, summary: &IndexSummary, dimensions: usize) -> Strin
     let images =
         if summary.images_embedded > 0 { format!(" ({} images)", summary.images_embedded) } else { String::new() };
     format!(
-        "indexed {}: {} files ({} unchanged, {} embedded{images} into {} chunks, {} removed{skipped}) in {:.1}s [{dimensions}d]",
+        "indexed {}: {} files ({} unchanged, {} embedded{images} into {} chunks, {} removed{skipped}) in {:.1}s [{}, {dimensions}d]",
         root.display(),
         summary.files_seen,
         summary.files_unchanged,
@@ -335,6 +303,7 @@ fn summary_line(root: &Path, summary: &IndexSummary, dimensions: usize) -> Strin
         summary.chunks_embedded,
         summary.files_removed,
         summary.elapsed.as_secs_f64(),
+        device_name(device),
     )
 }
 

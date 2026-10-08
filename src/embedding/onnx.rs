@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use ort::ep::directml::{DeviceFilter, PerformancePreference};
 use ort::ep::{CUDA, DirectML};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
@@ -129,7 +130,12 @@ impl GraphSession {
                 .map_err(|error| onnx_error(error.into()))?
                 .with_parallel_execution(false)
                 .map_err(|error| onnx_error(error.into()))?
-                .with_execution_providers([DirectML::default().build().error_on_failure()])
+                // Laptops pair an integrated GPU with a discrete one; adapter 0 is often the weaker.
+                .with_execution_providers([DirectML::default()
+                    .with_device_filter(DeviceFilter::Gpu)
+                    .with_performance_preference(PerformancePreference::HighPerformance)
+                    .build()
+                    .error_on_failure()])
                 .map_err(|error| onnx_error(error.into()))?,
         };
         let session = builder.commit_from_file(path).map_err(onnx_error)?;
