@@ -4,9 +4,10 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use sems::chunking::ChunkingConfig;
+use sems::discovery::{DiscoveryOptions, FileKind};
 use sems::embedding::{EmbeddingModel, ExecutionDevice, OnnxRuntime};
 use sems::encoder::{Encoder, GemmaEncoder, GemmaEncoderConfig};
 use sems::indexer::{IndexOptions, IndexProgress, IndexSummary, index_directory};
@@ -53,6 +54,24 @@ struct SearchArguments {
     /// Print results as JSON, including full chunk text
     #[arg(long)]
     json: bool,
+    /// Only return this kind of content
+    #[arg(long, value_enum)]
+    kind: Option<KindFilter>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KindFilter {
+    Text,
+    Image,
+}
+
+impl From<KindFilter> for FileKind {
+    fn from(filter: KindFilter) -> Self {
+        match filter {
+            KindFilter::Text => FileKind::Text,
+            KindFilter::Image => FileKind::Image,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -65,9 +84,15 @@ struct IndexArguments {
     /// Where to run the model while indexing. Searches always use the CPU, which starts faster.
     #[arg(long, env = "SEMS_DEVICE", default_value = "cpu", value_parser = parse_device)]
     device: ExecutionDevice,
-    /// Skip files larger than this many bytes
+    /// Skip text files larger than this many bytes
     #[arg(long, default_value_t = 1024 * 1024)]
     max_file_size: u64,
+    /// Skip images larger than this many bytes
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_image_size: u64,
+    /// Do not index images (each takes ~5 s on a CPU, well under 1 s with --device cuda)
+    #[arg(long)]
+    skip_images: bool,
 }
 
 /// Where sems keeps its index and finds its model; flags override environment variables.
@@ -226,6 +251,7 @@ fn run_search(arguments: &SearchArguments, locations: &Locations) -> Result<()> 
     let options = SearchOptions {
         limit: arguments.limit,
         one_result_per_file: arguments.files_with_matches,
+        kind: arguments.kind.map(FileKind::from),
         ..SearchOptions::default()
     };
     let results = search(&store, &mut encoder, &scope, query, options)?;
@@ -255,7 +281,14 @@ fn run_index(arguments: &IndexArguments, locations: &Locations) -> Result<()> {
     } else {
         IndexStore::open(&index_path, index_identity())?
     };
-    let options = IndexOptions { max_file_size: arguments.max_file_size, ..IndexOptions::default() };
+    let options = IndexOptions {
+        discovery: DiscoveryOptions {
+            max_text_size: arguments.max_file_size,
+            max_image_size: arguments.max_image_size,
+            include_images: !arguments.skip_images,
+        },
+        ..IndexOptions::default()
+    };
     let mut progress = TerminalProgress::new();
     let summary = index_directory(&mut store, &mut encoder, &root, &options, &mut progress)?;
     progress.finish();
@@ -270,25 +303,31 @@ fn run_status(path: Option<&Path>, locations: &Locations) -> Result<()> {
     let statistics = store.statistics(&PathScope::new(&root))?;
     let working_directory = std::env::current_dir()?;
     write_stdout(&format!(
-        "{}: {} files, {} chunks indexed\nindex: {}\n",
+        "{}: {} files ({} images), {} chunks indexed\nindex: {}\n",
         display_path(&root, &working_directory),
         statistics.files,
+        statistics.images,
         statistics.chunks,
         index_path.display()
     ))
 }
 
 fn summary_line(root: &Path, summary: &IndexSummary, dimensions: usize) -> String {
-    let mut skipped = Vec::new();
-    if summary.files_skipped_binary > 0 {
-        skipped.push(format!("{} binary", summary.files_skipped_binary));
-    }
-    if summary.files_skipped_too_large > 0 {
-        skipped.push(format!("{} too large", summary.files_skipped_too_large));
-    }
-    let skipped = if skipped.is_empty() { String::new() } else { format!(", skipped {}", skipped.join(" and ")) };
+    let skipped: Vec<String> = [
+        (summary.files_skipped_binary, "binary"),
+        (summary.files_skipped_too_large, "too large"),
+        (summary.images_skipped_too_small, "tiny images"),
+        (summary.images_unreadable, "unreadable images"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, reason)| format!("{count} {reason}"))
+    .collect();
+    let skipped = if skipped.is_empty() { String::new() } else { format!(", skipped {}", skipped.join(", ")) };
+    let images =
+        if summary.images_embedded > 0 { format!(" ({} images)", summary.images_embedded) } else { String::new() };
     format!(
-        "indexed {}: {} files ({} unchanged, {} embedded into {} chunks, {} removed{skipped}) in {:.1}s [{dimensions}d]",
+        "indexed {}: {} files ({} unchanged, {} embedded{images} into {} chunks, {} removed{skipped}) in {:.1}s [{dimensions}d]",
         root.display(),
         summary.files_seen,
         summary.files_unchanged,

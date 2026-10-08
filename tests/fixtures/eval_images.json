@@ -1,0 +1,42 @@
+[
+  {
+    "query": "a cat lying down",
+    "expected": "photos/IMG_0001.jpg"
+  },
+  {
+    "query": "cup of coffee on a saucer",
+    "expected": "photos/IMG_0002.jpg"
+  },
+  {
+    "query": "rocket launching into the sky",
+    "expected": "photos/IMG_0003.jpg"
+  },
+  {
+    "query": "many distant galaxies in deep space",
+    "expected": "photos/IMG_0004.jpg"
+  },
+  {
+    "query": "old coins in a museum",
+    "expected": "photos/IMG_0005.jpg"
+  },
+  {
+    "query": "silhouette of a horse",
+    "expected": "photos/IMG_0006.jpg"
+  },
+  {
+    "query": "red brick wall",
+    "expected": "photos/IMG_0008.jpg"
+  },
+  {
+    "query": "medical photo of the back of an eye",
+    "expected": "photos/IMG_0009.jpg"
+  },
+  {
+    "query": "portrait of an astronaut",
+    "expected": "photos/IMG_0010.jpg"
+  },
+  {
+    "query": "un gato",
+    "expected": "photos/IMG_0001.jpg"
+  }
+]

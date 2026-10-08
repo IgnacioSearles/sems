@@ -4,6 +4,7 @@
 //! encoder and stay independent of ONNX Runtime.
 
 use anyhow::{Context, Result, ensure};
+use image::DynamicImage;
 
 use crate::embedding::EmbeddingModel;
 
@@ -22,6 +23,8 @@ pub trait Encoder {
     fn encode_query(&mut self, query: &str) -> Result<Vec<f32>>;
     /// Unit-length vectors for documents, in input order.
     fn encode_documents(&mut self, documents: &[Document<'_>]) -> Result<Vec<Vec<f32>>>;
+    /// Unit-length vector for an image, in the same space as text, so text queries find images.
+    fn encode_image(&mut self, image: &DynamicImage) -> Result<Vec<f32>>;
 }
 
 /// Prompt formats from the EmbeddingGemma 2 model card (asymmetric retrieval).
@@ -80,6 +83,12 @@ impl Encoder for GemmaEncoder {
 
     fn encode_query(&mut self, query: &str) -> Result<Vec<f32>> {
         let embedding = self.model.embed_texts(&[&format!("{QUERY_PREFIX}{query}")])?.remove(0);
+        Ok(truncate_and_normalize(&embedding, self.config.dimensions))
+    }
+
+    fn encode_image(&mut self, image: &DynamicImage) -> Result<Vec<f32>> {
+        // The model card: images take no task prefix.
+        let embedding = self.model.embed_image(image)?;
         Ok(truncate_and_normalize(&embedding, self.config.dimensions))
     }
 

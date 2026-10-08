@@ -7,9 +7,10 @@ use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::chunking::Chunk;
+use crate::discovery::FileKind;
 
 /// Bumped whenever the schema changes incompatibly.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS metadata (
@@ -26,6 +27,7 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS chunks (
         id          INTEGER PRIMARY KEY,
         file_id     INTEGER NOT NULL REFERENCES files(id),
+        kind        TEXT NOT NULL CHECK (kind IN ('text', 'image')),
         start_line  INTEGER NOT NULL,
         end_line    INTEGER NOT NULL,
         text        TEXT NOT NULL,
@@ -62,18 +64,23 @@ pub struct FileRecord {
     pub content_hash: [u8; 32],
 }
 
+/// A stored chunk. Image chunks cover the whole file: no lines, no text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkRecord {
     pub path: PathBuf,
+    pub kind: FileKind,
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
     pub embedding: Vec<f32>,
 }
 
+/// Counts only files that produced chunks; skipped files (binary, tiny images) are tracked but
+/// not reported as indexed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScopeStatistics {
     pub files: usize,
+    pub images: usize,
     pub chunks: usize,
 }
 
@@ -205,13 +212,39 @@ impl IndexStore {
         rows.collect::<rusqlite::Result<_>>().context("failed to list indexed files")
     }
 
-    /// Replaces a file's chunks atomically (inserting the file if it is new).
-    pub fn replace_file(&mut self, path: &Path, record: &FileRecord, chunks: &[(Chunk, Vec<f32>)]) -> Result<()> {
-        for (_, embedding) in chunks {
+    /// Replaces a text file's chunks atomically (inserting the file if it is new).
+    pub fn replace_text_file(&mut self, path: &Path, record: &FileRecord, chunks: &[(Chunk, Vec<f32>)]) -> Result<()> {
+        let rows: Vec<ChunkRow<'_>> = chunks
+            .iter()
+            .map(|(chunk, embedding)| ChunkRow {
+                kind: FileKind::Text,
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                text: &chunk.text,
+                embedding,
+            })
+            .collect();
+        self.write_file(path, record, &rows)
+    }
+
+    /// Stores an image as a single chunk holding its embedding.
+    pub fn replace_image_file(&mut self, path: &Path, record: &FileRecord, embedding: &[f32]) -> Result<()> {
+        let row = ChunkRow { kind: FileKind::Image, start_line: 0, end_line: 0, text: "", embedding };
+        self.write_file(path, record, &[row])
+    }
+
+    /// Tracks a file that produced no chunks (binary, unreadable, too small), so unchanged runs
+    /// skip it by metadata instead of re-reading it every time.
+    pub fn record_skipped_file(&mut self, path: &Path, record: &FileRecord) -> Result<()> {
+        self.write_file(path, record, &[])
+    }
+
+    fn write_file(&mut self, path: &Path, record: &FileRecord, rows: &[ChunkRow<'_>]) -> Result<()> {
+        for row in rows {
             ensure!(
-                embedding.len() == self.identity.dimensions,
+                row.embedding.len() == self.identity.dimensions,
                 "embedding has {} dimensions, index expects {}",
-                embedding.len(),
+                row.embedding.len(),
                 self.identity.dimensions
             );
         }
@@ -227,15 +260,17 @@ impl IndexStore {
         )?;
         {
             let mut insert = transaction.prepare(
-                "INSERT INTO chunks(file_id, start_line, end_line, text, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO chunks(file_id, kind, start_line, end_line, text, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
-            for (chunk, embedding) in chunks {
+            for row in rows {
                 insert.execute(params![
                     file_id,
-                    chunk.start_line as i64,
-                    chunk.end_line as i64,
-                    chunk.text,
-                    encode_vector(embedding)
+                    kind_key(row.kind),
+                    row.start_line as i64,
+                    row.end_line as i64,
+                    row.text,
+                    encode_vector(row.embedding)
                 ])?;
             }
         }
@@ -258,15 +293,26 @@ impl IndexStore {
         transaction.commit().with_context(|| format!("failed to remove {} from the index", path.display()))
     }
 
-    /// Exact nearest neighbours by cosine similarity (vectors are unit length, so a dot product).
-    pub fn nearest_chunks(&self, scope: &PathScope, query: &[f32], limit: usize) -> Result<Vec<(i64, f32)>> {
+    /// Exact nearest neighbours by cosine similarity (vectors are unit length, so a dot product),
+    /// optionally restricted to one kind of content.
+    pub fn nearest_chunks(
+        &self,
+        scope: &PathScope,
+        query: &[f32],
+        limit: usize,
+        kind: Option<FileKind>,
+    ) -> Result<Vec<(i64, f32)>> {
         ensure!(query.len() == self.identity.dimensions, "query vector has the wrong dimensions");
         let sql = format!(
-            "SELECT c.id, c.embedding FROM chunks c JOIN files f ON f.id = c.file_id WHERE {}",
+            "SELECT c.id, c.embedding FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE {} AND (:kind IS NULL OR c.kind = :kind)",
             PathScope::CONDITION
         );
+        let kind = kind.map(kind_key);
+        let mut parameters: Vec<(&str, &dyn rusqlite::ToSql)> = vec![(":kind", &kind)];
+        parameters.extend(scope.parameters());
         let mut statement = self.connection.prepare(&sql)?;
-        let mut rows = statement.query(scope.parameters().as_slice())?;
+        let mut rows = statement.query(parameters.as_slice())?;
         let mut best = TopK::new(limit);
         while let Some(row) = rows.next()? {
             let embedding = row.get_ref(1)?.as_blob()?;
@@ -295,17 +341,18 @@ impl IndexStore {
     }
 
     pub fn chunk(&self, chunk_id: i64) -> Result<ChunkRecord> {
-        let (path, start_line, end_line, text, embedding): (String, i64, i64, String, Vec<u8>) = self
+        let (path, kind, start_line, end_line, text, embedding): (String, String, i64, i64, String, Vec<u8>) = self
             .connection
             .query_row(
-                "SELECT f.path, c.start_line, c.end_line, c.text, c.embedding
+                "SELECT f.path, c.kind, c.start_line, c.end_line, c.text, c.embedding
                  FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?1",
                 [chunk_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .with_context(|| format!("chunk {chunk_id} not found"))?;
         Ok(ChunkRecord {
             path: PathBuf::from(path),
+            kind: parse_kind(&kind)?,
             start_line: start_line as usize,
             end_line: end_line as usize,
             text,
@@ -315,12 +362,39 @@ impl IndexStore {
 
     pub fn statistics(&self, scope: &PathScope) -> Result<ScopeStatistics> {
         let sql = format!(
-            "SELECT COUNT(DISTINCT f.id), COUNT(c.id) FROM files f LEFT JOIN chunks c ON c.file_id = f.id WHERE {}",
+            "SELECT COUNT(DISTINCT c.file_id),
+                    COUNT(DISTINCT CASE WHEN c.kind = 'image' THEN c.file_id END),
+                    COUNT(c.id)
+             FROM chunks c JOIN files f ON f.id = c.file_id WHERE {}",
             PathScope::CONDITION
         );
-        let (files, chunks): (i64, i64) =
-            self.connection.query_row(&sql, scope.parameters().as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))?;
-        Ok(ScopeStatistics { files: files as usize, chunks: chunks as usize })
+        let (files, images, chunks): (i64, i64, i64) =
+            self.connection
+                .query_row(&sql, scope.parameters().as_slice(), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(ScopeStatistics { files: files as usize, images: images as usize, chunks: chunks as usize })
+    }
+}
+
+struct ChunkRow<'a> {
+    kind: FileKind,
+    start_line: usize,
+    end_line: usize,
+    text: &'a str,
+    embedding: &'a [f32],
+}
+
+fn kind_key(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Text => "text",
+        FileKind::Image => "image",
+    }
+}
+
+fn parse_kind(key: &str) -> Result<FileKind> {
+    match key {
+        "text" => Ok(FileKind::Text),
+        "image" => Ok(FileKind::Image),
+        other => bail!("unknown chunk kind {other:?} in index"),
     }
 }
 
@@ -416,11 +490,11 @@ mod tests {
     fn replacing_a_file_swaps_its_chunks_and_keyword_entries() {
         let mut store = IndexStore::open_in_memory(identity()).unwrap();
         let path = root().join("notes.txt");
-        store.replace_file(&path, &record(1), &[chunk("old_term", [1.0, 0.0])]).unwrap();
-        store.replace_file(&path, &record(2), &[chunk("new_term", [0.0, 1.0])]).unwrap();
+        store.replace_text_file(&path, &record(1), &[chunk("old_term", [1.0, 0.0])]).unwrap();
+        store.replace_text_file(&path, &record(2), &[chunk("new_term", [0.0, 1.0])]).unwrap();
 
         let scope = PathScope::new(&root());
-        assert_eq!(store.statistics(&scope).unwrap(), ScopeStatistics { files: 1, chunks: 1 });
+        assert_eq!(store.statistics(&scope).unwrap(), ScopeStatistics { files: 1, images: 0, chunks: 1 });
         assert!(store.keyword_chunks(&scope, "\"old_term\"", 10).unwrap().is_empty());
         assert_eq!(store.keyword_chunks(&scope, "\"new_term\"", 10).unwrap().len(), 1);
         assert_eq!(store.files_in_scope(&scope).unwrap()[&path].content_hash, [2; 32]);
@@ -430,22 +504,46 @@ mod tests {
     fn nearest_chunks_ranks_by_similarity_within_scope() {
         let mut store = IndexStore::open_in_memory(identity()).unwrap();
         let inside = root().join("project");
-        store.replace_file(&inside.join("a.txt"), &record(1), &[chunk("a", [1.0, 0.0])]).unwrap();
-        store.replace_file(&inside.join("b.txt"), &record(2), &[chunk("b", [0.6, 0.8])]).unwrap();
-        store.replace_file(&root().join("project-other/c.txt"), &record(3), &[chunk("c", [1.0, 0.0])]).unwrap();
+        store.replace_text_file(&inside.join("a.txt"), &record(1), &[chunk("a", [1.0, 0.0])]).unwrap();
+        store.replace_text_file(&inside.join("b.txt"), &record(2), &[chunk("b", [0.6, 0.8])]).unwrap();
+        store.replace_text_file(&root().join("project-other/c.txt"), &record(3), &[chunk("c", [1.0, 0.0])]).unwrap();
 
-        let results = store.nearest_chunks(&PathScope::new(&inside), &[1.0, 0.0], 10).unwrap();
+        let results = store.nearest_chunks(&PathScope::new(&inside), &[1.0, 0.0], 10, None).unwrap();
         let paths: Vec<PathBuf> = results.iter().map(|(id, _)| store.chunk(*id).unwrap().path).collect();
         assert_eq!(paths, [inside.join("a.txt"), inside.join("b.txt")]);
         assert!((results[1].1 - 0.6).abs() < 1e-6);
     }
 
     #[test]
+    fn nearest_chunks_can_be_restricted_to_images() {
+        let mut store = IndexStore::open_in_memory(identity()).unwrap();
+        store.replace_text_file(&root().join("a.txt"), &record(1), &[chunk("a", [1.0, 0.0])]).unwrap();
+        store.replace_image_file(&root().join("b.jpg"), &record(2), &[0.6, 0.8]).unwrap();
+
+        let scope = PathScope::new(&root());
+        let results = store.nearest_chunks(&scope, &[1.0, 0.0], 10, Some(FileKind::Image)).unwrap();
+        assert_eq!(results.len(), 1);
+        let image = store.chunk(results[0].0).unwrap();
+        assert_eq!((image.kind, image.path), (FileKind::Image, root().join("b.jpg")));
+        assert_eq!(store.statistics(&scope).unwrap(), ScopeStatistics { files: 2, images: 1, chunks: 2 });
+    }
+
+    #[test]
+    fn skipped_files_are_tracked_but_not_counted() {
+        let mut store = IndexStore::open_in_memory(identity()).unwrap();
+        let path = root().join("blob.bin");
+        store.record_skipped_file(&path, &record(1)).unwrap();
+        let scope = PathScope::new(&root());
+        assert!(store.files_in_scope(&scope).unwrap().contains_key(&path));
+        assert_eq!(store.statistics(&scope).unwrap().files, 0);
+    }
+
+    #[test]
     fn scope_can_be_a_single_file() {
         let mut store = IndexStore::open_in_memory(identity()).unwrap();
         let path = root().join("one.txt");
-        store.replace_file(&path, &record(1), &[chunk("x", [1.0, 0.0])]).unwrap();
-        store.replace_file(&root().join("one.txt.bak"), &record(2), &[chunk("x", [1.0, 0.0])]).unwrap();
+        store.replace_text_file(&path, &record(1), &[chunk("x", [1.0, 0.0])]).unwrap();
+        store.replace_text_file(&root().join("one.txt.bak"), &record(2), &[chunk("x", [1.0, 0.0])]).unwrap();
         assert_eq!(store.statistics(&PathScope::new(&path)).unwrap().files, 1);
     }
 
@@ -453,10 +551,10 @@ mod tests {
     fn removing_a_file_removes_its_chunks() {
         let mut store = IndexStore::open_in_memory(identity()).unwrap();
         let path = root().join("gone.txt");
-        store.replace_file(&path, &record(1), &[chunk("vanishing", [1.0, 0.0])]).unwrap();
+        store.replace_text_file(&path, &record(1), &[chunk("vanishing", [1.0, 0.0])]).unwrap();
         store.remove_file(&path).unwrap();
         let scope = PathScope::new(&root());
-        assert_eq!(store.statistics(&scope).unwrap(), ScopeStatistics { files: 0, chunks: 0 });
+        assert_eq!(store.statistics(&scope).unwrap(), ScopeStatistics { files: 0, images: 0, chunks: 0 });
         assert!(store.keyword_chunks(&scope, "\"vanishing\"", 10).unwrap().is_empty());
     }
 
@@ -475,7 +573,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("index.db");
         let mut old = IndexStore::open(&path, identity()).unwrap();
-        old.replace_file(&root().join("old.txt"), &record(1), &[chunk("stale", [1.0, 0.0])]).unwrap();
+        old.replace_text_file(&root().join("old.txt"), &record(1), &[chunk("stale", [1.0, 0.0])]).unwrap();
         drop(old);
 
         let other = IndexIdentity { chunker_version: 2, ..identity() };
@@ -489,6 +587,6 @@ mod tests {
     fn rejects_embeddings_of_the_wrong_size() {
         let mut store = IndexStore::open_in_memory(identity()).unwrap();
         let bad = (Chunk { start_line: 1, end_line: 1, text: "x".into() }, vec![1.0, 0.0, 0.0]);
-        assert!(store.replace_file(&root().join("bad.txt"), &record(1), &[bad]).is_err());
+        assert!(store.replace_text_file(&root().join("bad.txt"), &record(1), &[bad]).is_err());
     }
 }

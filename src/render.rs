@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::search::SearchResult;
+use crate::search::{ResultContent, SearchResult};
 
 /// Longer lines (minified code, long prose lines) are cut so one result cannot flood the screen.
 const MAX_LINE_CHARACTERS: usize = 160;
@@ -38,8 +38,8 @@ pub fn render(results: &[SearchResult], format: OutputFormat, style: Style, work
     }
 }
 
-/// Each result is its whole chunk (one function or section, at most a few dozen lines), so the
-/// lines that matched are shown in full rather than a preview of the chunk's start.
+/// Each text result is its whole chunk (one function or section, at most a few dozen lines), so
+/// the lines that matched are shown in full; image results show the file and its dimensions.
 fn render_text(results: &[SearchResult], style: Style, working_directory: &Path) -> String {
     let mut output = String::new();
     for (index, result) in results.iter().enumerate() {
@@ -48,19 +48,40 @@ fn render_text(results: &[SearchResult], style: Style, working_directory: &Path)
         }
         // Colors follow ripgrep: magenta paths, green line numbers.
         let path = style.paint("35", &display_path(&result.path, working_directory));
-        let lines = style.paint("32", &format!("{}-{}", result.start_line, result.end_line));
-        writeln!(output, "{path}:{lines}  {}", style.paint("2", &format!("{:.2}", result.similarity))).unwrap();
-        let width = result.end_line.to_string().len();
-        for (line_number, line) in numbered_lines(result) {
-            let gutter = style.paint("32", &format!("{line_number:>width$}"));
-            if line.is_empty() {
-                writeln!(output, "{gutter}:").unwrap();
-            } else {
-                writeln!(output, "{gutter}: {line}").unwrap();
+        let similarity = style.paint("2", &format!("{:.2}", result.similarity));
+        match &result.content {
+            ResultContent::Text { start_line, end_line, text } => {
+                let lines = style.paint("32", &format!("{start_line}-{end_line}"));
+                writeln!(output, "{path}:{lines}  {similarity}").unwrap();
+                write_numbered_lines(&mut output, style, *start_line, *end_line, text);
+            }
+            ResultContent::Image => {
+                writeln!(output, "{path}  {similarity}  {}", style.paint("36", &image_label(&result.path))).unwrap();
             }
         }
     }
     output
+}
+
+fn write_numbered_lines(output: &mut String, style: Style, start_line: usize, end_line: usize, text: &str) {
+    let width = end_line.to_string().len();
+    for (line_number, line) in numbered_lines(start_line, text) {
+        let gutter = style.paint("32", &format!("{line_number:>width$}"));
+        if line.is_empty() {
+            writeln!(output, "{gutter}:").unwrap();
+        } else {
+            writeln!(output, "{gutter}: {line}").unwrap();
+        }
+    }
+}
+
+/// `[image 4032x3024]`, read from the file header only; just `[image]` if the file has changed
+/// or moved since it was indexed.
+fn image_label(path: &Path) -> String {
+    match image::image_dimensions(path) {
+        Ok((width, height)) => format!("[image {width}x{height}]"),
+        Err(_) => "[image]".to_string(),
+    }
 }
 
 fn render_files(results: &[SearchResult], working_directory: &Path) -> String {
@@ -86,8 +107,8 @@ pub fn display_path(path: &Path, working_directory: &Path) -> String {
 
 /// The chunk's lines with their line numbers, minus the indentation they all share so nested code
 /// does not drift right. Overlong lines are cut on a character boundary.
-fn numbered_lines(result: &SearchResult) -> Vec<(usize, String)> {
-    let lines: Vec<&str> = result.text.lines().map(str::trim_end).collect();
+fn numbered_lines(start_line: usize, text: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
     let shared_indent = lines
         .iter()
         .filter(|line| !line.is_empty())
@@ -104,7 +125,7 @@ fn numbered_lines(result: &SearchResult) -> Vec<(usize, String)> {
                 Some((cut, _)) => format!("{}…", &line[..cut]),
                 None => line.to_string(),
             };
-            (result.start_line + offset, line)
+            (start_line + offset, line)
         })
         .collect()
 }
@@ -116,11 +137,41 @@ mod tests {
     fn result(path: &str, start_line: usize, text: &str) -> SearchResult {
         SearchResult {
             path: PathBuf::from(path),
-            start_line,
-            end_line: start_line + text.lines().count().max(1) - 1,
             similarity: 0.5,
-            text: text.into(),
+            content: ResultContent::Text {
+                start_line,
+                end_line: start_line + text.lines().count().max(1) - 1,
+                text: text.into(),
+            },
         }
+    }
+
+    #[test]
+    fn image_results_show_dimensions_from_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let photo = directory.path().join("beach.png");
+        image::RgbImage::new(120, 80).save(&photo).unwrap();
+        let results = [
+            SearchResult { path: photo, similarity: 0.73, content: ResultContent::Image },
+            SearchResult { path: directory.path().join("gone.jpg"), similarity: 0.5, content: ResultContent::Image },
+        ];
+        let output = render(&results, OutputFormat::Text, Style { color: false }, directory.path());
+        assert_eq!(output, "beach.png  0.73  [image 120x80]\n\ngone.jpg  0.50  [image]\n");
+    }
+
+    #[test]
+    fn json_tags_each_result_with_its_kind() {
+        let results = [
+            result("a.txt", 1, "x"),
+            SearchResult { path: PathBuf::from("b.jpg"), similarity: 0.5, content: ResultContent::Image },
+        ];
+        let json: serde_json::Value =
+            serde_json::from_str(&render(&results, OutputFormat::Json, Style { color: false }, &working_directory()))
+                .unwrap();
+        assert_eq!(json[0]["kind"], "text");
+        assert_eq!(json[0]["start_line"], 1);
+        assert_eq!(json[1]["kind"], "image");
+        assert!(json[1].get("start_line").is_none());
     }
 
     fn working_directory() -> PathBuf {
@@ -152,7 +203,7 @@ mod tests {
 
     #[test]
     fn long_lines_are_cut_on_character_boundaries() {
-        let lines = numbered_lines(&result("a.txt", 1, &"é".repeat(500)));
+        let lines = numbered_lines(1, &"é".repeat(500));
         assert_eq!(lines[0].1.chars().count(), MAX_LINE_CHARACTERS + 1);
     }
 

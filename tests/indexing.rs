@@ -4,10 +4,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use image::DynamicImage;
 use sems::chunking::ChunkingConfig;
+use sems::discovery::FileKind;
 use sems::encoder::{Document, Encoder};
 use sems::indexer::{IndexOptions, IndexSummary, SilentProgress, index_directory};
-use sems::search::{SearchOptions, search};
+use sems::search::{ResultContent, SearchOptions, search};
 use sems::store::{IndexIdentity, IndexStore, PathScope};
 
 const DIMENSIONS: usize = 64;
@@ -17,6 +19,7 @@ const DIMENSIONS: usize = 64;
 #[derive(Default)]
 struct BagOfWordsEncoder {
     documents_encoded: usize,
+    images_encoded: usize,
 }
 
 impl BagOfWordsEncoder {
@@ -47,6 +50,20 @@ impl Encoder for BagOfWordsEncoder {
     fn encode_documents(&mut self, documents: &[Document<'_>]) -> Result<Vec<Vec<f32>>> {
         self.documents_encoded += documents.len();
         Ok(documents.iter().map(|document| Self::vector(document.text)).collect())
+    }
+
+    /// Names the image's dominant channel, so a red picture lands near the query "red".
+    fn encode_image(&mut self, image: &DynamicImage) -> Result<Vec<f32>> {
+        self.images_encoded += 1;
+        let rgb = image.to_rgb8();
+        let mut totals = [0u64; 3];
+        for pixel in rgb.pixels() {
+            for (total, value) in totals.iter_mut().zip(pixel.0) {
+                *total += u64::from(value);
+            }
+        }
+        let dominant = ["red", "green", "blue"][(0..3).max_by_key(|&channel| totals[channel]).unwrap()];
+        Ok(Self::vector(dominant))
     }
 }
 
@@ -79,6 +96,12 @@ impl Fixture {
     fn index(&mut self) -> IndexSummary {
         let options = IndexOptions::default();
         index_directory(&mut self.store, &mut self.encoder, &self.root, &options, &mut SilentProgress).unwrap()
+    }
+
+    fn write_image(&self, relative: &str, color: [u8; 3], size: u32) {
+        let path = self.root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::RgbImage::from_pixel(size, size, image::Rgb(color)).save(path).unwrap();
     }
 
     fn top_result(&mut self, query: &str) -> Option<PathBuf> {
@@ -163,7 +186,7 @@ fn deleted_and_newly_ignored_files_leave_the_index() {
 #[test]
 fn binary_files_are_skipped() {
     let mut fixture = Fixture::new();
-    std::fs::write(fixture.root.join("image.png"), b"\x89PNG\r\n\x1a\n\x00\x00\x00").unwrap();
+    std::fs::write(fixture.root.join("program.bin"), b"MZ\x90\x00\x03\x00\x00\x00").unwrap();
     fixture.write("readme.txt", "hello");
     let summary = fixture.index();
     assert_eq!((summary.files_embedded, summary.files_skipped_binary), (1, 1));
@@ -203,4 +226,51 @@ fn one_result_per_file_makes_the_limit_count_files() {
     let mut paths: Vec<PathBuf> = results.iter().map(|result| relative(&fixture.root, &result.path)).collect();
     paths.sort();
     assert_eq!(paths, [PathBuf::from("long.txt"), PathBuf::from("short.txt")]);
+}
+
+#[test]
+fn images_are_indexed_and_found_by_text_queries() {
+    let mut fixture = Fixture::new();
+    fixture.write_image("photos/sunset.png", [220, 40, 30], 100);
+    fixture.write_image("photos/forest.png", [20, 180, 40], 100);
+    fixture.write("notes.txt", "meeting notes about the budget");
+
+    let summary = fixture.index();
+    assert_eq!((summary.files_embedded, summary.images_embedded), (3, 2));
+    assert_eq!(fixture.top_result("red"), Some(PathBuf::from("photos/sunset.png")));
+
+    let scope = PathScope::new(&fixture.root);
+    let options = SearchOptions { kind: Some(FileKind::Image), ..SearchOptions::default() };
+    let results = search(&fixture.store, &mut fixture.encoder, &scope, "budget", options).unwrap();
+    assert!(results.iter().all(|result| result.content == ResultContent::Image), "kind filter leaked text");
+    assert_eq!(fixture.store.statistics(&scope).unwrap().images, 2);
+}
+
+#[test]
+fn tiny_and_corrupt_images_are_skipped_once_and_not_reread() {
+    let mut fixture = Fixture::new();
+    fixture.write_image("icon.png", [0, 0, 255], 16);
+    std::fs::write(fixture.root.join("broken.jpg"), b"\xFF\xD8\xFF\xE0 truncated").unwrap();
+    std::fs::write(fixture.root.join("blob.bin"), b"\x00\x01\x02").unwrap();
+
+    let summary = fixture.index();
+    assert_eq!((summary.images_skipped_too_small, summary.images_unreadable, summary.files_skipped_binary), (1, 1, 1));
+    assert_eq!(fixture.encoder.images_encoded, 0);
+
+    let second = fixture.index();
+    assert_eq!(second.files_unchanged, 3, "skipped files are tracked, so unchanged ones are not re-read");
+}
+
+#[test]
+fn skipping_images_leaves_them_out_of_the_index() {
+    let mut fixture = Fixture::new();
+    fixture.write_image("photo.png", [220, 40, 30], 100);
+    fixture.write("readme.txt", "hello");
+    let mut options = IndexOptions::default();
+    options.discovery.include_images = false;
+
+    let summary =
+        index_directory(&mut fixture.store, &mut fixture.encoder, &fixture.root, &options, &mut SilentProgress)
+            .unwrap();
+    assert_eq!((summary.files_seen, summary.images_embedded), (1, 0));
 }

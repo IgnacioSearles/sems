@@ -28,16 +28,20 @@ pub struct ChunkingConfig {
     /// Upper bound on chunk size, roughly 4 characters per token. Protects against minified or
     /// generated files whose few lines are enormous.
     pub max_characters: usize,
+    /// Chunks with fewer non-whitespace characters than this (`mod tests {`, a lone decorator) are
+    /// merged into a neighbour: with almost no content their embeddings sit near the centre of the
+    /// space and match unrelated queries (`#[cfg(test)] mod tests {` scored 0.72 for "a cat").
+    pub min_characters: usize,
 }
 
 impl ChunkingConfig {
     /// Bumped whenever the chunking output changes, so stale indexes are rebuilt.
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
 }
 
 impl Default for ChunkingConfig {
     fn default() -> Self {
-        Self { min_lines: 4, max_lines: 30, overlap_lines: 5, max_characters: 3_000 }
+        Self { min_lines: 4, max_lines: 30, overlap_lines: 5, max_characters: 3_000, min_characters: 60 }
     }
 }
 
@@ -78,7 +82,63 @@ pub fn chunk_text(text: &str, config: &ChunkingConfig) -> Vec<Chunk> {
             }
         }
     }
-    chunks
+    merge_content_free_chunks(chunks, &lines, config)
+}
+
+/// Folds each chunk below `min_characters` into the following chunk (the last one into its
+/// predecessor), as long as the result stays within the character budget.
+fn merge_content_free_chunks(chunks: Vec<Chunk>, lines: &[&str], config: &ChunkingConfig) -> Vec<Chunk> {
+    let mut merged: Vec<Chunk> = Vec::with_capacity(chunks.len());
+    let mut pending: Option<Chunk> = None;
+    for chunk in chunks {
+        let chunk = match pending.take() {
+            Some(small) => match join_chunks(&small, &chunk, lines, config) {
+                Some(joined) => joined,
+                None => {
+                    merged.push(small);
+                    chunk
+                }
+            },
+            None => chunk,
+        };
+        if meaningful_characters(&chunk.text) < config.min_characters {
+            pending = Some(chunk);
+        } else {
+            merged.push(chunk);
+        }
+    }
+    if let Some(small) = pending {
+        match merged.pop() {
+            Some(previous) => match join_chunks(&previous, &small, lines, config) {
+                Some(joined) => merged.push(joined),
+                None => merged.extend([previous, small]),
+            },
+            None => merged.push(small),
+        }
+    }
+    merged
+}
+
+/// The span from `first`'s start to `second`'s end, if both are whole-line chunks (not pieces of
+/// a split long line) and the span fits the character budget.
+fn join_chunks(first: &Chunk, second: &Chunk, lines: &[&str], config: &ChunkingConfig) -> Option<Chunk> {
+    if !is_whole_lines(first, lines) || !is_whole_lines(second, lines) || second.end_line < first.end_line {
+        return None;
+    }
+    let text = lines[first.start_line - 1..second.end_line].join("\n");
+    (text.len() <= config.max_characters).then_some(Chunk {
+        start_line: first.start_line,
+        end_line: second.end_line,
+        text,
+    })
+}
+
+fn is_whole_lines(chunk: &Chunk, lines: &[&str]) -> bool {
+    chunk.start_line != chunk.end_line || chunk.text.len() == lines[chunk.start_line - 1].len()
+}
+
+fn meaningful_characters(text: &str) -> usize {
+    text.chars().filter(|character| !character.is_whitespace()).count()
 }
 
 fn is_blank(line: &str) -> bool {
@@ -171,7 +231,7 @@ mod tests {
     use super::*;
 
     fn config(min_lines: usize, max_lines: usize, overlap_lines: usize) -> ChunkingConfig {
-        ChunkingConfig { min_lines, max_lines, overlap_lines, max_characters: 10_000 }
+        ChunkingConfig { min_lines, max_lines, overlap_lines, max_characters: 10_000, min_characters: 0 }
     }
 
     fn ranges(chunks: &[Chunk]) -> Vec<(usize, usize)> {
@@ -274,6 +334,27 @@ def run():
     }
 
     #[test]
+    fn content_free_chunks_merge_into_the_next_one() {
+        let code = "#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn helper() -> Vec<String> {\n        vec![\"alpha\".into(), \"beta\".into(), \"gamma\".into()]\n    }\n}\n";
+        let config =
+            ChunkingConfig { min_lines: 2, max_lines: 5, overlap_lines: 0, max_characters: 10_000, min_characters: 60 };
+        assert_eq!(ranges(&chunk_text(code, &config)), [(1, 8)]);
+    }
+
+    #[test]
+    fn a_trailing_content_free_chunk_joins_its_predecessor() {
+        let text = "This paragraph has plenty of meaningful words to stand on its own as a chunk.\n\nok\n";
+        let config = ChunkingConfig {
+            min_lines: 1,
+            max_lines: 30,
+            overlap_lines: 0,
+            max_characters: 10_000,
+            min_characters: 10,
+        };
+        assert_eq!(ranges(&chunk_text(text, &config)), [(1, 3)]);
+    }
+
+    #[test]
     fn empty_and_blank_text_produce_no_chunks() {
         assert!(chunk_text("", &ChunkingConfig::default()).is_empty());
         assert!(chunk_text("\n   \n\t\n", &ChunkingConfig::default()).is_empty());
@@ -294,16 +375,20 @@ def run():
     #[test]
     fn character_budget_ends_windows_early() {
         let text = "a".repeat(40) + "\n" + &"b".repeat(40) + "\n" + &"c".repeat(40);
-        let chunks =
-            chunk_text(&text, &ChunkingConfig { min_lines: 1, max_lines: 60, overlap_lines: 0, max_characters: 90 });
+        let chunks = chunk_text(
+            &text,
+            &ChunkingConfig { min_lines: 1, max_lines: 60, overlap_lines: 0, max_characters: 90, min_characters: 0 },
+        );
         assert_eq!(ranges(&chunks), [(1, 2), (3, 3)]);
     }
 
     #[test]
     fn oversized_single_line_is_split_on_char_boundaries() {
         let line = "é".repeat(10); // 2 bytes per char
-        let chunks =
-            chunk_text(&line, &ChunkingConfig { min_lines: 1, max_lines: 60, overlap_lines: 0, max_characters: 7 });
+        let chunks = chunk_text(
+            &line,
+            &ChunkingConfig { min_lines: 1, max_lines: 60, overlap_lines: 0, max_characters: 7, min_characters: 0 },
+        );
         assert!(chunks.iter().all(|chunk| chunk.start_line == 1 && chunk.text.len() <= 7));
         assert_eq!(chunks.iter().map(|chunk| chunk.text.as_str()).collect::<String>(), line);
     }

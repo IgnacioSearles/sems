@@ -24,10 +24,21 @@ code, headings), so results point at the lines that matched rather than a fixed-
 Powered by [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2), running locally on
 ONNX Runtime. Nothing leaves your machine.
 
+Photos are searchable by what they show, in any of the model's 100+ languages:
+
+```console
+> sems --kind image "space"
+tests\fixtures\eval_corpus\photos\IMG_0004.jpg  0.78  [image 512x446]
+
+tests\fixtures\eval_corpus\photos\IMG_0003.jpg  0.72  [image 512x342]
+...
+> sems -n 1 "astronauta"
+tests\fixtures\eval_corpus\photos\IMG_0010.jpg  0.77  [image 512x512]
+```
+
 ## Status
 
-Milestone 1: text and code. Images, PDFs, video, and audio come next (the runtime already embeds
-images; they are not indexed yet).
+Text, code, and images. PDFs, video, and audio come next.
 
 ## Usage
 
@@ -35,19 +46,28 @@ images; they are not indexed yet).
 sems <QUERY> [PATH]           search under PATH (default: current directory)
     -n, --limit <N>           number of results (default 10)
     -l, --files-with-matches  print matching file paths only, best first
-        --json                full results as JSON, for scripts and coding agents
+        --json                full results as JSON (with a "kind" per result), for scripts and agents
+        --kind <text|image>   only return this kind of content
 sems index [PATH]             index or incrementally update PATH
         --device <cpu|cuda|directml>
+        --skip-images         leave images out (see below)
         --rebuild             discard the index and start over
 sems status [PATH]            what is indexed under PATH
 ```
 
-Indexing respects `.gitignore`, skips hidden, binary and large (>1 MB) files, and reads a
-`.semsignore` file (same syntax) for anything else to leave out. Re-indexing only embeds files whose
-content changed.
+Indexing respects `.gitignore`, skips hidden, binary and large (>1 MB text, >64 MB image) files,
+and reads a `.semsignore` file (same syntax) for anything else to leave out. Re-indexing only
+embeds files whose content changed.
+
+Images (JPEG, PNG, WebP, GIF, BMP, TIFF; not HEIC yet) are embedded from their pixels, upright
+according to their EXIF orientation. Images under 64 px on a side are skipped as icons. Text and
+images share one ranking: the model scores a photo query highest against the right photo and a
+text query highest against text, so no `--kind` is needed to keep them apart.
 
 Searches always run on the CPU (~1.2 s including model load). `--device` speeds up indexing:
-roughly 3x with DirectML and 11x with CUDA compared to CPU on an RTX 3050 Ti.
+roughly 3x with DirectML and 11x with CUDA compared to CPU on an RTX 3050 Ti. Images cost about
+5 s each on a CPU and well under a second with CUDA, so index photo folders with a GPU, or pass
+`--skip-images` for code repositories on CPU-only machines.
 
 ## Setup (development)
 

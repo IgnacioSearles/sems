@@ -6,16 +6,34 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 
+use crate::media::is_image_path;
+
 /// Per-directory ignore file for paths that should stay out of the index but not out of git.
 pub const IGNORE_FILE_NAME: &str = ".semsignore";
 /// How much of a file to inspect when deciding whether it is binary (same heuristic as git).
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
+/// How a file is indexed: text is chunked and embedded as text, images are embedded from pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Text,
+    Image,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredFile {
     pub path: PathBuf,
+    pub kind: FileKind,
     pub size: u64,
     pub modified_nanoseconds: i64,
+}
+
+/// Per-kind size limits: a large text file is usually generated data, a large photo is normal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryOptions {
+    pub max_text_size: u64,
+    pub max_image_size: u64,
+    pub include_images: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -25,7 +43,7 @@ pub struct Discovery {
 }
 
 /// Lists regular files under `root` without reading their contents.
-pub fn discover_files(root: &Path, max_file_size: u64) -> Result<Discovery> {
+pub fn discover_files(root: &Path, options: &DiscoveryOptions) -> Result<Discovery> {
     let mut discovery = Discovery::default();
     let walker = WalkBuilder::new(root).add_custom_ignore_filename(IGNORE_FILE_NAME).build();
     for entry in walker {
@@ -35,12 +53,21 @@ pub fn discover_files(root: &Path, max_file_size: u64) -> Result<Discovery> {
         }
         let metadata =
             entry.metadata().with_context(|| format!("failed to read metadata of {}", entry.path().display()))?;
-        if metadata.len() > max_file_size {
+        let kind = if is_image_path(entry.path()) { FileKind::Image } else { FileKind::Text };
+        if kind == FileKind::Image && !options.include_images {
+            continue;
+        }
+        let max_size = match kind {
+            FileKind::Text => options.max_text_size,
+            FileKind::Image => options.max_image_size,
+        };
+        if metadata.len() > max_size {
             discovery.skipped_too_large += 1;
             continue;
         }
         discovery.files.push(DiscoveredFile {
             path: entry.into_path(),
+            kind,
             size: metadata.len(),
             modified_nanoseconds: modified_nanoseconds(&metadata),
         });
@@ -97,8 +124,35 @@ mod tests {
         write(root, "Cargo.lock", b"lock");
         write(root, ".hidden/secret.txt", b"hidden");
 
-        let discovery = discover_files(root, u64::MAX).unwrap();
+        let discovery = discover_files(root, &unlimited()).unwrap();
         assert_eq!(relative_paths(root, &discovery), ["src/main.rs"]);
+    }
+
+    fn unlimited() -> DiscoveryOptions {
+        DiscoveryOptions { max_text_size: u64::MAX, max_image_size: u64::MAX, include_images: true }
+    }
+
+    #[test]
+    fn classifies_images_and_applies_per_kind_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path(), "photo.JPG", &[b'x'; 100]);
+        write(directory.path(), "notes.txt", &[b'x'; 100]);
+        let options = DiscoveryOptions { max_text_size: 50, max_image_size: 1_000, include_images: true };
+
+        let discovery = discover_files(directory.path(), &options).unwrap();
+        assert_eq!(relative_paths(directory.path(), &discovery), ["photo.JPG"]);
+        assert_eq!(discovery.files[0].kind, FileKind::Image);
+        assert_eq!(discovery.skipped_too_large, 1);
+    }
+
+    #[test]
+    fn images_can_be_excluded() {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path(), "photo.png", b"x");
+        write(directory.path(), "notes.txt", b"x");
+        let options = DiscoveryOptions { include_images: false, ..unlimited() };
+        let discovery = discover_files(directory.path(), &options).unwrap();
+        assert_eq!(relative_paths(directory.path(), &discovery), ["notes.txt"]);
     }
 
     #[test]
@@ -107,7 +161,8 @@ mod tests {
         write(directory.path(), "small.txt", b"tiny");
         write(directory.path(), "large.txt", &[b'x'; 100]);
 
-        let discovery = discover_files(directory.path(), 50).unwrap();
+        let options = DiscoveryOptions { max_text_size: 50, ..unlimited() };
+        let discovery = discover_files(directory.path(), &options).unwrap();
         assert_eq!(relative_paths(directory.path(), &discovery), ["small.txt"]);
         assert_eq!(discovery.skipped_too_large, 1);
     }
