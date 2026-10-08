@@ -1,0 +1,4 @@
+# Binary fixtures must never have line endings rewritten: a PDF stores byte offsets to its own objects.
+*.pdf binary
+*.png binary
+*.jpg binary

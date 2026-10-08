@@ -10,7 +10,7 @@ use crate::chunking::Chunk;
 use crate::discovery::FileKind;
 
 /// Bumped whenever the schema changes incompatibly.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS metadata (
@@ -27,7 +27,8 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS chunks (
         id          INTEGER PRIMARY KEY,
         file_id     INTEGER NOT NULL REFERENCES files(id),
-        kind        TEXT NOT NULL CHECK (kind IN ('text', 'image')),
+        kind        TEXT NOT NULL CHECK (kind IN ('text', 'image', 'pdf')),
+        page        INTEGER,
         start_line  INTEGER NOT NULL,
         end_line    INTEGER NOT NULL,
         text        TEXT NOT NULL,
@@ -64,11 +65,13 @@ pub struct FileRecord {
     pub content_hash: [u8; 32],
 }
 
-/// A stored chunk. Image chunks cover the whole file: no lines, no text.
+/// A stored chunk. Image chunks cover the whole file: no lines, no text. PDF chunks carry the
+/// page they come from, and lines counted within that page's extracted text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkRecord {
     pub path: PathBuf,
     pub kind: FileKind,
+    pub page: Option<usize>,
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
@@ -82,6 +85,45 @@ pub struct ScopeStatistics {
     pub files: usize,
     pub images: usize,
     pub chunks: usize,
+}
+
+/// Running mean and spread of query similarities across every chunk in a search's scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SimilarityStatistics {
+    count: usize,
+    sum: f64,
+    sum_of_squares: f64,
+}
+
+impl SimilarityStatistics {
+    fn add(&mut self, similarity: f32) {
+        let similarity = f64::from(similarity);
+        self.count += 1;
+        self.sum += similarity;
+        self.sum_of_squares += similarity * similarity;
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    pub fn mean(&self) -> f32 {
+        if self.count == 0 { 0.0 } else { (self.sum / self.count as f64) as f32 }
+    }
+
+    pub fn standard_deviation(&self) -> f32 {
+        if self.count < 2 {
+            return 0.0;
+        }
+        let mean = self.sum / self.count as f64;
+        ((self.sum_of_squares / self.count as f64 - mean * mean).max(0.0)).sqrt() as f32
+    }
+
+    /// How many standard deviations `similarity` sits above the mean; 0 when there is no spread.
+    pub fn standard_score(&self, similarity: f32) -> f32 {
+        let deviation = self.standard_deviation();
+        if deviation == 0.0 { 0.0 } else { (similarity - self.mean()) / deviation }
+    }
 }
 
 /// Restricts queries to one file or everything under one directory.
@@ -218,6 +260,7 @@ impl IndexStore {
             .iter()
             .map(|(chunk, embedding)| ChunkRow {
                 kind: FileKind::Text,
+                page: None,
                 start_line: chunk.start_line,
                 end_line: chunk.end_line,
                 text: &chunk.text,
@@ -229,8 +272,29 @@ impl IndexStore {
 
     /// Stores an image as a single chunk holding its embedding.
     pub fn replace_image_file(&mut self, path: &Path, record: &FileRecord, embedding: &[f32]) -> Result<()> {
-        let row = ChunkRow { kind: FileKind::Image, start_line: 0, end_line: 0, text: "", embedding };
+        let row = ChunkRow { kind: FileKind::Image, page: None, start_line: 0, end_line: 0, text: "", embedding };
         self.write_file(path, record, &[row])
+    }
+
+    /// Replaces a PDF's chunks; each carries its 1-based page number.
+    pub fn replace_pdf_file(
+        &mut self,
+        path: &Path,
+        record: &FileRecord,
+        chunks: &[(usize, Chunk, Vec<f32>)],
+    ) -> Result<()> {
+        let rows: Vec<ChunkRow<'_>> = chunks
+            .iter()
+            .map(|(page, chunk, embedding)| ChunkRow {
+                kind: FileKind::Pdf,
+                page: Some(*page),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                text: &chunk.text,
+                embedding,
+            })
+            .collect();
+        self.write_file(path, record, &rows)
     }
 
     /// Tracks a file that produced no chunks (binary, unreadable, too small), so unchanged runs
@@ -260,13 +324,14 @@ impl IndexStore {
         )?;
         {
             let mut insert = transaction.prepare(
-                "INSERT INTO chunks(file_id, kind, start_line, end_line, text, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO chunks(file_id, kind, page, start_line, end_line, text, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for row in rows {
                 insert.execute(params![
                     file_id,
                     kind_key(row.kind),
+                    row.page.map(|page| page as i64),
                     row.start_line as i64,
                     row.end_line as i64,
                     row.text,
@@ -302,6 +367,18 @@ impl IndexStore {
         limit: usize,
         kind: Option<FileKind>,
     ) -> Result<Vec<(i64, f32)>> {
+        Ok(self.nearest_chunks_with_background(scope, query, limit, kind)?.0)
+    }
+
+    /// Like [`Self::nearest_chunks`], plus statistics over every chunk scored. The scan visits all
+    /// chunks anyway, so how far a result stands out from the rest costs nothing extra.
+    pub fn nearest_chunks_with_background(
+        &self,
+        scope: &PathScope,
+        query: &[f32],
+        limit: usize,
+        kind: Option<FileKind>,
+    ) -> Result<(Vec<(i64, f32)>, SimilarityStatistics)> {
         ensure!(query.len() == self.identity.dimensions, "query vector has the wrong dimensions");
         let sql = format!(
             "SELECT c.id, c.embedding FROM chunks c JOIN files f ON f.id = c.file_id
@@ -314,11 +391,14 @@ impl IndexStore {
         let mut statement = self.connection.prepare(&sql)?;
         let mut rows = statement.query(parameters.as_slice())?;
         let mut best = TopK::new(limit);
+        let mut background = SimilarityStatistics::default();
         while let Some(row) = rows.next()? {
             let embedding = row.get_ref(1)?.as_blob()?;
-            best.offer(row.get(0)?, dot_product_with_encoded(query, embedding)?);
+            let similarity = dot_product_with_encoded(query, embedding)?;
+            background.add(similarity);
+            best.offer(row.get(0)?, similarity);
         }
-        Ok(best.into_sorted())
+        Ok((best.into_sorted(), background))
     }
 
     /// Best keyword matches by BM25. Higher scores are better.
@@ -341,18 +421,20 @@ impl IndexStore {
     }
 
     pub fn chunk(&self, chunk_id: i64) -> Result<ChunkRecord> {
-        let (path, kind, start_line, end_line, text, embedding): (String, String, i64, i64, String, Vec<u8>) = self
+        type Row = (String, String, Option<i64>, i64, i64, String, Vec<u8>);
+        let (path, kind, page, start_line, end_line, text, embedding): Row = self
             .connection
             .query_row(
-                "SELECT f.path, c.kind, c.start_line, c.end_line, c.text, c.embedding
+                "SELECT f.path, c.kind, c.page, c.start_line, c.end_line, c.text, c.embedding
                  FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?1",
                 [chunk_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
             )
             .with_context(|| format!("chunk {chunk_id} not found"))?;
         Ok(ChunkRecord {
             path: PathBuf::from(path),
             kind: parse_kind(&kind)?,
+            page: page.map(|page| page as usize),
             start_line: start_line as usize,
             end_line: end_line as usize,
             text,
@@ -377,6 +459,7 @@ impl IndexStore {
 
 struct ChunkRow<'a> {
     kind: FileKind,
+    page: Option<usize>,
     start_line: usize,
     end_line: usize,
     text: &'a str,
@@ -387,6 +470,7 @@ fn kind_key(kind: FileKind) -> &'static str {
     match kind {
         FileKind::Text => "text",
         FileKind::Image => "image",
+        FileKind::Pdf => "pdf",
     }
 }
 
@@ -394,6 +478,7 @@ fn parse_kind(key: &str) -> Result<FileKind> {
     match key {
         "text" => Ok(FileKind::Text),
         "image" => Ok(FileKind::Image),
+        "pdf" => Ok(FileKind::Pdf),
         other => bail!("unknown chunk kind {other:?} in index"),
     }
 }
@@ -526,6 +611,16 @@ mod tests {
         let image = store.chunk(results[0].0).unwrap();
         assert_eq!((image.kind, image.path), (FileKind::Image, root().join("b.jpg")));
         assert_eq!(store.statistics(&scope).unwrap(), ScopeStatistics { files: 2, images: 1, chunks: 2 });
+    }
+
+    #[test]
+    fn pdf_chunks_keep_their_page() {
+        let mut store = IndexStore::open_in_memory(identity()).unwrap();
+        let (chunk, embedding) = chunk("notice period", [1.0, 0.0]);
+        store.replace_pdf_file(&root().join("lease.pdf"), &record(1), &[(3, chunk, embedding)]).unwrap();
+        let results = store.nearest_chunks(&PathScope::new(&root()), &[1.0, 0.0], 10, Some(FileKind::Pdf)).unwrap();
+        let stored = store.chunk(results[0].0).unwrap();
+        assert_eq!((stored.kind, stored.page), (FileKind::Pdf, Some(3)));
     }
 
     #[test]

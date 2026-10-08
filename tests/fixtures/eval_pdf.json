@@ -1,0 +1,37 @@
+[
+  {
+    "query": "how much is the monthly rent",
+    "expected": "docs/lease_agreement.pdf",
+    "expected_page": 1
+  },
+  {
+    "query": "am I allowed to keep a pet in the apartment",
+    "expected": "docs/lease_agreement.pdf",
+    "expected_page": 2
+  },
+  {
+    "query": "who pays for small repairs like a dripping tap",
+    "expected": "docs/lease_agreement.pdf",
+    "expected_page": 2
+  },
+  {
+    "query": "how much notice do I need to give before moving out",
+    "expected": "docs/lease_agreement.pdf",
+    "expected_page": 3
+  },
+  {
+    "query": "how much did revenue grow this quarter",
+    "expected": "docs/quarterly_report.pdf",
+    "expected_page": 1
+  },
+  {
+    "query": "what are the main business risks",
+    "expected": "docs/quarterly_report.pdf",
+    "expected_page": 2
+  },
+  {
+    "query": "¿cuánto cuesta el alquiler al mes?",
+    "expected": "docs/lease_agreement.pdf",
+    "expected_page": 1
+  }
+]

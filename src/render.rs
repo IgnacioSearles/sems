@@ -58,6 +58,17 @@ fn render_text(results: &[SearchResult], style: Style, working_directory: &Path)
             ResultContent::Image => {
                 writeln!(output, "{path}  {similarity}  {}", style.paint("36", &image_label(&result.path))).unwrap();
             }
+            ResultContent::Pdf { page, text, .. } => {
+                writeln!(output, "{path}  {}  {similarity}", style.paint("32", &format!("page {page}"))).unwrap();
+                // Line numbers within extracted PDF text mean nothing to a reader; the page does.
+                for (_, line) in numbered_lines(1, text) {
+                    if line.is_empty() {
+                        output.push('\n');
+                    } else {
+                        writeln!(output, "    {line}").unwrap();
+                    }
+                }
+            }
         }
     }
     output
@@ -157,6 +168,27 @@ mod tests {
         ];
         let output = render(&results, OutputFormat::Text, Style { color: false }, directory.path());
         assert_eq!(output, "beach.png  0.73  [image 120x80]\n\ngone.jpg  0.50  [image]\n");
+    }
+
+    #[test]
+    fn pdf_results_show_the_page_and_text_without_line_numbers() {
+        let results = [SearchResult {
+            path: PathBuf::from("lease.pdf"),
+            similarity: 0.81,
+            content: ResultContent::Pdf {
+                page: 3,
+                start_line: 1,
+                end_line: 2,
+                text: "4. Termination\nTwo months' notice.".into(),
+            },
+        }];
+        let output = render(&results, OutputFormat::Text, Style { color: false }, &working_directory());
+        assert_eq!(output, "lease.pdf  page 3  0.81\n    4. Termination\n    Two months' notice.\n");
+        let json: serde_json::Value =
+            serde_json::from_str(&render(&results, OutputFormat::Json, Style { color: false }, &working_directory()))
+                .unwrap();
+        assert_eq!((json[0]["kind"].as_str(), json[0]["page"].as_u64()), (Some("pdf"), Some(3)));
+        assert!(json[0].get("start_line").is_none(), "lines within a PDF page are internal");
     }
 
     #[test]

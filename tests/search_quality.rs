@@ -9,6 +9,7 @@
 //! - localization: does the top result contain the right line? (`eval_localization.json`)
 //! - images: does a text description rank the right photo first, among text and other photos?
 //!   (`eval_images.json`; photo file names are generic, so only pixels can answer)
+//! - PDFs: does the top result point at the right page of the right PDF? (`eval_pdf.json`)
 //!
 //! Recall saturates on a corpus this small, so image queries also report the similarity margin:
 //! the right photo's score minus the best other result's. It shrinks before rankings break.
@@ -21,7 +22,7 @@ use sems::discovery::FileKind;
 use sems::embedding::{EmbeddingModel, ExecutionDevice, OnnxRuntime};
 use sems::encoder::{Encoder, GemmaEncoder, GemmaEncoderConfig};
 use sems::indexer::{IndexOptions, SilentProgress, index_directory};
-use sems::search::{ResultContent, SearchOptions, SearchResult, search};
+use sems::search::{CLIFF_IN_STANDARD_DEVIATIONS, ResultContent, SearchOptions, SearchResult, search};
 use sems::store::{IndexIdentity, IndexStore, PathScope};
 use serde::Deserialize;
 
@@ -29,6 +30,7 @@ use serde::Deserialize;
 const MINIMUM_RECALL_AT_1: f32 = 0.9;
 const MINIMUM_LOCATED_AT_1: f32 = 0.9;
 const MINIMUM_IMAGE_RECALL_AT_1: f32 = 0.9;
+const MINIMUM_PDF_PAGE_RECALL_AT_1: f32 = 0.85;
 
 #[derive(Deserialize)]
 struct LabelledQuery {
@@ -36,6 +38,8 @@ struct LabelledQuery {
     expected: String,
     /// For localization queries: a line the top result must contain.
     expected_line: Option<usize>,
+    /// For PDF queries: the page the top result must come from.
+    expected_page: Option<usize>,
 }
 
 struct Evaluation {
@@ -61,6 +65,7 @@ impl Evaluation {
                 format!("{}:{start_line}-{end_line}", self.relative_path(result))
             }
             ResultContent::Image => self.relative_path(result),
+            ResultContent::Pdf { page, .. } => format!("{} page {page}", self.relative_path(result)),
         }
     }
 
@@ -68,15 +73,22 @@ impl Evaluation {
         let line_matches = match (&result.content, labelled.expected_line) {
             (_, None) => true,
             (ResultContent::Text { start_line, end_line, .. }, Some(line)) => (*start_line..=*end_line).contains(&line),
-            (ResultContent::Image, Some(_)) => false,
+            (ResultContent::Image | ResultContent::Pdf { .. }, Some(_)) => false,
         };
-        self.relative_path(result) == labelled.expected && line_matches
+        let page_matches = match (&result.content, labelled.expected_page) {
+            (_, None) => true,
+            (ResultContent::Pdf { page, .. }, Some(expected)) => *page == expected,
+            (_, Some(_)) => false,
+        };
+        self.relative_path(result) == labelled.expected && line_matches && page_matches
     }
 
     /// Mean and smallest gap between the expected result's similarity and the best other result's.
     fn margins(&mut self, queries: &[LabelledQuery]) -> (f32, f32) {
         let scope = PathScope::new(&self.corpus);
-        let options = SearchOptions { limit: 20, one_result_per_file: true, ..SearchOptions::default() };
+        // Raw separation: the relevance cutoff would remove the very results being compared against.
+        let options =
+            SearchOptions { limit: 20, one_result_per_file: true, relevance_cutoff: false, ..SearchOptions::default() };
         let margins: Vec<f32> = queries
             .iter()
             .map(|labelled| {
@@ -138,6 +150,7 @@ fn build_evaluation(vision_token_budget: usize) -> Evaluation {
     let summary =
         index_directory(&mut store, &mut encoder, &corpus, &IndexOptions::default(), &mut SilentProgress).unwrap();
     assert!(summary.images_embedded > 0, "the corpus photos were not indexed");
+    assert_eq!(summary.pdfs_without_text, 1, "the scanned PDF should be recognized as text-less");
     Evaluation { store, encoder, corpus }
 }
 
@@ -160,6 +173,7 @@ fn retrieval_localization_and_images_meet_floor() {
         let images = load_queries("eval_images.json");
         let image_recall = evaluation.score("image recall@1 (mixed with text)", &images, None);
         let image_only_recall = evaluation.score("image recall@1 (--kind image)", &images, Some(FileKind::Image));
+        let pdf_recall = evaluation.score("pdf page recall@1", &load_queries("eval_pdf.json"), None);
         let (mean_margin, smallest_margin) = evaluation.margins(&images);
         println!("{:<34} mean {mean_margin:.3}, smallest {smallest_margin:.3}", "image similarity margin");
 
@@ -168,6 +182,51 @@ fn retrieval_localization_and_images_meet_floor() {
             assert!(located >= MINIMUM_LOCATED_AT_1, "localization regressed: {located:.2}");
             assert!(image_recall >= MINIMUM_IMAGE_RECALL_AT_1, "image retrieval regressed: {image_recall:.2}");
             assert!(image_only_recall >= image_recall, "filtering to images should never hurt");
+            assert!(pdf_recall >= MINIMUM_PDF_PAGE_RECALL_AT_1, "PDF retrieval regressed: {pdf_recall:.2}");
         }
     }
+}
+
+/// Prints, per labelled query, the widest drop between consecutive top similarities (in standard
+/// deviations of all similarities in scope) and how many results the cutoff keeps. Asserts the
+/// cutoff never hides the expected file. Used to calibrate CLIFF_IN_STANDARD_DEVIATIONS.
+#[test]
+#[ignore = "requires exported model and SEMS_ONNXRUNTIME"]
+fn relevance_cutoff_calibration() {
+    let mut evaluation = build_evaluation(GemmaEncoderConfig::default().vision_token_budget);
+    let scope = PathScope::new(&evaluation.corpus);
+    let mut kept_total = 0;
+    let mut queries = 0;
+    let mut hidden = Vec::new();
+    for file_name in ["eval_queries.json", "eval_localization.json", "eval_images.json", "eval_pdf.json"] {
+        for labelled in load_queries(file_name) {
+            let query = evaluation.encoder.encode_query(&labelled.query).unwrap();
+            let (ranked, background) =
+                evaluation.store.nearest_chunks_with_background(&scope, &query, 20, None).unwrap();
+            let (cliff_rank, cliff) = ranked
+                .windows(2)
+                .enumerate()
+                .map(|(index, pair)| (index + 1, (pair[0].1 - pair[1].1) / background.standard_deviation()))
+                .max_by(|left, right| left.1.total_cmp(&right.1))
+                .unwrap();
+            let results =
+                search(&evaluation.store, &mut evaluation.encoder, &scope, &labelled.query, SearchOptions::default())
+                    .unwrap();
+            if !results.iter().any(|result| evaluation.relative_path(result) == labelled.expected) {
+                hidden.push(labelled.query.clone());
+            }
+            println!(
+                "{:<48} widest drop {cliff:.2} sd after rank {cliff_rank:>2}  -> {} results kept",
+                labelled.query.chars().take(48).collect::<String>(),
+                results.len()
+            );
+            kept_total += results.len();
+            queries += 1;
+        }
+    }
+    println!(
+        "cliff factor {CLIFF_IN_STANDARD_DEVIATIONS}: {:.1} of up to 10 results kept on average",
+        kept_total as f32 / queries as f32
+    );
+    assert!(hidden.is_empty(), "the relevance cutoff hid the expected file for {hidden:?}");
 }

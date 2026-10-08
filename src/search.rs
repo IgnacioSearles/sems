@@ -24,6 +24,13 @@ const CANDIDATES_PER_RETRIEVER: usize = 100;
 /// Standard RRF damping constant; larger values flatten the advantage of top ranks.
 const RRF_K: f32 = 60.0;
 
+/// Number of top semantic candidates examined for a cliff (see [`relevance_floor`]).
+const CLIFF_WINDOW: usize = 20;
+/// A drop between consecutive candidates at least this many background standard deviations wide
+/// is a cliff: the end of the results that stand out. Calibrated by search_quality's
+/// relevance_separation.
+pub const CLIFF_IN_STANDARD_DEVIATIONS: f32 = 0.75;
+
 #[derive(Debug, Clone, Copy)]
 pub struct SearchOptions {
     pub limit: usize,
@@ -33,11 +40,14 @@ pub struct SearchOptions {
     pub one_result_per_file: bool,
     /// Restrict results to text or to images; `None` searches both.
     pub kind: Option<FileKind>,
+    /// Drop results below the similarity cliff (see [`relevance_floor`]); `sems --all` turns
+    /// this off.
+    pub relevance_cutoff: bool,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
-        Self { limit: 10, keyword_weight: 1.0, one_result_per_file: false, kind: None }
+        Self { limit: 10, keyword_weight: 1.0, one_result_per_file: false, kind: None, relevance_cutoff: true }
     }
 }
 
@@ -58,6 +68,16 @@ pub enum ResultContent {
     Text { start_line: usize, end_line: usize, text: String },
     /// A whole image file.
     Image,
+    /// Text from one page of a PDF (1-based page). Lines count within the page's extracted text,
+    /// which readers never see, so they are kept for de-duplication but not serialized.
+    Pdf {
+        page: usize,
+        #[serde(skip_serializing)]
+        start_line: usize,
+        #[serde(skip_serializing)]
+        end_line: usize,
+        text: String,
+    },
 }
 
 pub fn search(
@@ -68,7 +88,8 @@ pub fn search(
     options: SearchOptions,
 ) -> Result<Vec<SearchResult>> {
     let query_vector = encoder.encode_query(query)?;
-    let semantic = store.nearest_chunks(scope, &query_vector, CANDIDATES_PER_RETRIEVER, options.kind)?;
+    let (semantic, background) =
+        store.nearest_chunks_with_background(scope, &query_vector, CANDIDATES_PER_RETRIEVER, options.kind)?;
     // Images carry no text, so keyword retrieval only ever contributes text chunks.
     let keyword = match keyword_query(query) {
         Some(fts_query) if options.kind != Some(FileKind::Image) => {
@@ -76,6 +97,10 @@ pub fn search(
         }
         _ => Vec::new(),
     };
+
+    let semantic_similarities: Vec<f32> = semantic.iter().map(|(_, similarity)| *similarity).collect();
+    let floor = relevance_floor(&semantic_similarities, background.standard_deviation(), CLIFF_IN_STANDARD_DEVIATIONS)
+        .filter(|_| options.relevance_cutoff);
 
     let fused = reciprocal_rank_fusion(&[(&semantic, 1.0), (&keyword, options.keyword_weight)]);
     let mut results: Vec<SearchResult> = Vec::with_capacity(options.limit);
@@ -89,9 +114,21 @@ pub fn search(
                 ResultContent::Text { start_line: chunk.start_line, end_line: chunk.end_line, text: chunk.text }
             }
             FileKind::Image => ResultContent::Image,
+            FileKind::Pdf => ResultContent::Pdf {
+                page: chunk.page.unwrap_or(1),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                text: chunk.text,
+            },
         };
-        let candidate =
-            SearchResult { similarity: dot_product(&query_vector, &chunk.embedding), path: chunk.path, content };
+        let similarity = dot_product(&query_vector, &chunk.embedding);
+        // Exact keyword matches are evidence on their own, and the best result always shows.
+        let below_floor = floor.is_some_and(|floor| similarity < floor);
+        let matched_every_keyword = keyword.iter().any(|(id, _)| *id == chunk_id);
+        if below_floor && !matched_every_keyword && !results.is_empty() {
+            continue;
+        }
+        let candidate = SearchResult { similarity, path: chunk.path, content };
         // Chunks overlap by design; a lower-ranked neighbour would mostly repeat a better result.
         let redundant = if options.one_result_per_file {
             results.iter().any(|kept| kept.path == candidate.path)
@@ -114,8 +151,32 @@ fn overlaps(left: &SearchResult, right: &SearchResult) -> bool {
             ResultContent::Text { start_line: left_start, end_line: left_end, .. },
             ResultContent::Text { start_line: right_start, end_line: right_end, .. },
         ) => left_start <= right_end && right_start <= left_end,
+        (
+            ResultContent::Pdf { page: left_page, start_line: left_start, end_line: left_end, .. },
+            ResultContent::Pdf { page: right_page, start_line: right_start, end_line: right_end, .. },
+        ) => left_page == right_page && left_start <= right_end && right_start <= left_end,
         _ => true,
     }
+}
+
+/// The similarity below which results are cut, if the top candidates show a cliff.
+///
+/// Relevant results stand out together, then similarities fall to a long, flat tail of near-misses.
+/// The cliff is the widest drop between consecutive candidates within the first [`CLIFF_WINDOW`];
+/// it counts only if it is at least `cliff_factor` times `spread` (the standard deviation of all
+/// similarities in scope), so a smooth curve of many relevant results is not cut at all.
+///
+/// Absolute and standardized thresholds were measured first and failed: on tests/fixtures right
+/// answers scored from 0.663 while wrong ones reached 0.735, and in a code-only index the scores
+/// cluster so tightly (std 0.026) that unrelated chunks reach 2.6 standard deviations.
+pub fn relevance_floor(similarities_descending: &[f32], spread: f32, cliff_factor: f32) -> Option<f32> {
+    let window = &similarities_descending[..similarities_descending.len().min(CLIFF_WINDOW)];
+    let (index, drop) = window
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| (index, pair[0] - pair[1]))
+        .max_by(|left, right| left.1.total_cmp(&right.1))?;
+    (spread > 0.0 && drop >= cliff_factor * spread).then_some(window[index])
 }
 
 /// Merges rankings: each list contributes `weight / (RRF_K + rank)` per item. Returns ids by
@@ -185,6 +246,27 @@ mod tests {
         assert!(overlaps(&result("a", 1, 60), &result("a", 49, 108)));
         assert!(!overlaps(&result("a", 1, 60), &result("a", 61, 120)));
         assert!(!overlaps(&result("a", 1, 60), &result("b", 1, 60)));
+    }
+
+    #[test]
+    fn a_cliff_after_the_relevant_results_sets_the_floor() {
+        // Measured for "a cat lying down" on this repository: two matches, then a flat tail.
+        let similarities = [0.723, 0.723, 0.694, 0.691, 0.688, 0.687, 0.687, 0.685];
+        assert_eq!(relevance_floor(&similarities, 0.026, 0.75), Some(0.723));
+    }
+
+    #[test]
+    fn a_smooth_curve_is_not_cut() {
+        // Measured for "how are tiny images skipped": many relevant chunks, no cliff.
+        let similarities = [0.767, 0.759, 0.750, 0.750, 0.749, 0.742, 0.739, 0.738, 0.737, 0.732];
+        assert_eq!(relevance_floor(&similarities, 0.039, 0.75), None);
+    }
+
+    #[test]
+    fn no_floor_without_candidates_or_spread() {
+        assert_eq!(relevance_floor(&[], 0.03, 0.75), None);
+        assert_eq!(relevance_floor(&[0.9], 0.03, 0.75), None);
+        assert_eq!(relevance_floor(&[0.9, 0.1], 0.0, 0.75), None);
     }
 
     #[test]

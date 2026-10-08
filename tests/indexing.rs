@@ -261,6 +261,41 @@ fn tiny_and_corrupt_images_are_skipped_once_and_not_reread() {
     assert_eq!(second.files_unchanged, 3, "skipped files are tracked, so unchanged ones are not re-read");
 }
 
+fn copy_pdf_fixture(fixture: &Fixture, name: &str) {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/eval_corpus/docs").join(name);
+    std::fs::copy(source, fixture.root.join(name)).unwrap();
+}
+
+#[test]
+fn pdfs_are_indexed_page_by_page() {
+    let mut fixture = Fixture::new();
+    copy_pdf_fixture(&fixture, "lease_agreement.pdf");
+    let summary = fixture.index();
+    assert_eq!(summary.files_embedded, 1);
+
+    let scope = PathScope::new(&fixture.root);
+    let options = SearchOptions { kind: Some(FileKind::Pdf), relevance_cutoff: false, ..SearchOptions::default() };
+    let results = search(&fixture.store, &mut fixture.encoder, &scope, "termination notice", options).unwrap();
+    let pages: Vec<usize> = results
+        .iter()
+        .map(|result| match result.content {
+            ResultContent::Pdf { page, .. } => page,
+            ref other => panic!("expected a PDF result, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(pages.first(), Some(&3), "the termination clause is on page 3");
+}
+
+#[test]
+fn scanned_and_corrupt_pdfs_are_skipped() {
+    let mut fixture = Fixture::new();
+    copy_pdf_fixture(&fixture, "scanned_receipt.pdf");
+    std::fs::write(fixture.root.join("broken.pdf"), b"%PDF-1.4 truncated").unwrap();
+    let summary = fixture.index();
+    assert_eq!((summary.pdfs_without_text, summary.pdfs_unreadable, summary.files_embedded), (1, 1, 0));
+    assert_eq!(fixture.index().files_unchanged, 2, "skipped PDFs are tracked and not re-read");
+}
+
 #[test]
 fn skipping_images_leaves_them_out_of_the_index() {
     let mut fixture = Fixture::new();

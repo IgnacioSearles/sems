@@ -1,6 +1,7 @@
 pub mod chunking;
 pub mod device;
 pub mod discovery;
+pub mod documents;
 pub mod embedding;
 pub mod encoder;
 pub mod indexer;

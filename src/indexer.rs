@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 
 use crate::chunking::{Chunk, ChunkingConfig, chunk_text};
 use crate::discovery::{DiscoveredFile, DiscoveryOptions, FileKind, decode_text, discover_files};
+use crate::documents::extract_pdf_text;
 use crate::encoder::{Document, Encoder};
 use crate::media::{LoadedImage, load_image};
 use crate::store::{FileRecord, IndexStore, PathScope};
@@ -30,7 +31,7 @@ impl Default for IndexOptions {
         Self {
             discovery: DiscoveryOptions {
                 max_text_size: 1024 * 1024,
-                max_image_size: 64 * 1024 * 1024,
+                max_media_size: 64 * 1024 * 1024,
                 include_images: true,
             },
             chunking: ChunkingConfig::default(),
@@ -49,6 +50,8 @@ pub struct IndexSummary {
     pub files_skipped_too_large: usize,
     pub images_skipped_too_small: usize,
     pub images_unreadable: usize,
+    pub pdfs_without_text: usize,
+    pub pdfs_unreadable: usize,
     pub chunks_embedded: usize,
     pub elapsed: Duration,
 }
@@ -67,10 +70,17 @@ impl IndexProgress for SilentProgress {
     fn files_embedded(&mut self, _files_done: usize, _chunks_done: usize) {}
 }
 
+/// A text file or a PDF, chunked and waiting for embeddings. PDF chunks carry their page.
 struct PendingText {
     path: PathBuf,
     record: FileRecord,
-    chunks: Vec<Chunk>,
+    kind: FileKind,
+    chunks: Vec<PendingChunk>,
+}
+
+struct PendingChunk {
+    page: Option<usize>,
+    chunk: Chunk,
 }
 
 /// Images are only hashed while scanning; pixels are decoded when it is their turn to embed.
@@ -123,14 +133,31 @@ pub fn index_directory(
         match file.kind {
             FileKind::Image => pending.images.push(PendingImage { path: file.path.clone(), record }),
             FileKind::Text => match decode_text(&bytes) {
-                Some(text) => pending.texts.push(PendingText {
-                    path: file.path.clone(),
-                    record,
-                    chunks: chunk_text(&text, &options.chunking),
-                }),
+                Some(text) => {
+                    let chunks = chunk_text(&text, &options.chunking)
+                        .into_iter()
+                        .map(|chunk| PendingChunk { page: None, chunk })
+                        .collect();
+                    pending.texts.push(PendingText { path: file.path.clone(), record, kind: FileKind::Text, chunks });
+                }
                 None => {
                     store.record_skipped_file(&file.path, &record)?;
                     summary.files_skipped_binary += 1;
+                }
+            },
+            // Unreadable and text-less PDFs are tracked as skipped, like other unusable files.
+            FileKind::Pdf => match extract_pdf_text(&bytes) {
+                Ok(text) if text.has_text() => {
+                    let chunks = chunk_pdf_pages(&text.pages, &options.chunking);
+                    pending.texts.push(PendingText { path: file.path.clone(), record, kind: FileKind::Pdf, chunks });
+                }
+                Ok(_) => {
+                    store.record_skipped_file(&file.path, &record)?;
+                    summary.pdfs_without_text += 1;
+                }
+                Err(_) => {
+                    store.record_skipped_file(&file.path, &record)?;
+                    summary.pdfs_unreadable += 1;
                 }
             },
         }
@@ -147,6 +174,17 @@ pub fn index_directory(
     embed_images(store, encoder, pending.images, progress, &mut summary)?;
     summary.elapsed = started.elapsed();
     Ok(summary)
+}
+
+/// Chunks each page separately, so no chunk spans a page break and every result has one page.
+fn chunk_pdf_pages(pages: &[String], chunking: &ChunkingConfig) -> Vec<PendingChunk> {
+    pages
+        .iter()
+        .enumerate()
+        .flat_map(|(index, page)| {
+            chunk_text(page, chunking).into_iter().map(move |chunk| PendingChunk { page: Some(index + 1), chunk })
+        })
+        .collect()
 }
 
 fn metadata_matches(record: &FileRecord, file: &DiscoveredFile) -> bool {
@@ -188,19 +226,27 @@ fn store_text_group(
     let documents: Vec<Document<'_>> = group
         .iter()
         .zip(&titles)
-        .flat_map(|(file, title)| file.chunks.iter().map(move |chunk| Document { title, text: &chunk.text }))
+        .flat_map(|(file, title)| file.chunks.iter().map(move |pending| Document { title, text: &pending.chunk.text }))
         .collect();
     let mut embeddings = encoder.encode_documents(&documents)?.into_iter();
 
     for file in group {
-        let chunks: Vec<(Chunk, Vec<f32>)> = file
-            .chunks
-            .into_iter()
-            .map(|chunk| (chunk, embeddings.next().expect("encoder returns one embedding per document")))
-            .collect();
-        summary.chunks_embedded += chunks.len();
+        summary.chunks_embedded += file.chunks.len();
         summary.files_embedded += 1;
-        store.replace_text_file(&file.path, &file.record, &chunks)?;
+        let embedded = file.chunks.into_iter().map(|pending| {
+            let embedding = embeddings.next().expect("encoder returns one embedding per document");
+            (pending, embedding)
+        });
+        if file.kind == FileKind::Pdf {
+            let chunks: Vec<(usize, Chunk, Vec<f32>)> = embedded
+                .map(|(pending, embedding)| (pending.page.expect("PDF chunks carry a page"), pending.chunk, embedding))
+                .collect();
+            store.replace_pdf_file(&file.path, &file.record, &chunks)?;
+        } else {
+            let chunks: Vec<(Chunk, Vec<f32>)> =
+                embedded.map(|(pending, embedding)| (pending.chunk, embedding)).collect();
+            store.replace_text_file(&file.path, &file.record, &chunks)?;
+        }
     }
     Ok(())
 }

@@ -13,11 +13,23 @@ pub const IGNORE_FILE_NAME: &str = ".semsignore";
 /// How much of a file to inspect when deciding whether it is binary (same heuristic as git).
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
-/// How a file is indexed: text is chunked and embedded as text, images are embedded from pixels.
+/// How a file is indexed: text is chunked and embedded as text, images are embedded from pixels,
+/// and PDFs have their text extracted and chunked page by page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Text,
     Image,
+    Pdf,
+}
+
+impl FileKind {
+    fn of(path: &Path) -> Self {
+        if is_image_path(path) {
+            return Self::Image;
+        }
+        let is_pdf = path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+        if is_pdf { Self::Pdf } else { Self::Text }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,11 +40,13 @@ pub struct DiscoveredFile {
     pub modified_nanoseconds: i64,
 }
 
-/// Per-kind size limits: a large text file is usually generated data, a large photo is normal.
+/// Per-kind size limits: a large text file is usually generated data, while large photos and
+/// PDFs are normal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryOptions {
     pub max_text_size: u64,
-    pub max_image_size: u64,
+    /// Limit for images and PDFs.
+    pub max_media_size: u64,
     pub include_images: bool,
 }
 
@@ -53,13 +67,13 @@ pub fn discover_files(root: &Path, options: &DiscoveryOptions) -> Result<Discove
         }
         let metadata =
             entry.metadata().with_context(|| format!("failed to read metadata of {}", entry.path().display()))?;
-        let kind = if is_image_path(entry.path()) { FileKind::Image } else { FileKind::Text };
+        let kind = FileKind::of(entry.path());
         if kind == FileKind::Image && !options.include_images {
             continue;
         }
         let max_size = match kind {
             FileKind::Text => options.max_text_size,
-            FileKind::Image => options.max_image_size,
+            FileKind::Image | FileKind::Pdf => options.max_media_size,
         };
         if metadata.len() > max_size {
             discovery.skipped_too_large += 1;
@@ -129,7 +143,7 @@ mod tests {
     }
 
     fn unlimited() -> DiscoveryOptions {
-        DiscoveryOptions { max_text_size: u64::MAX, max_image_size: u64::MAX, include_images: true }
+        DiscoveryOptions { max_text_size: u64::MAX, max_media_size: u64::MAX, include_images: true }
     }
 
     #[test]
@@ -137,12 +151,19 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         write(directory.path(), "photo.JPG", &[b'x'; 100]);
         write(directory.path(), "notes.txt", &[b'x'; 100]);
-        let options = DiscoveryOptions { max_text_size: 50, max_image_size: 1_000, include_images: true };
+        let options = DiscoveryOptions { max_text_size: 50, max_media_size: 1_000, include_images: true };
 
         let discovery = discover_files(directory.path(), &options).unwrap();
         assert_eq!(relative_paths(directory.path(), &discovery), ["photo.JPG"]);
         assert_eq!(discovery.files[0].kind, FileKind::Image);
         assert_eq!(discovery.skipped_too_large, 1);
+    }
+
+    #[test]
+    fn recognizes_pdfs_case_insensitively() {
+        assert_eq!(FileKind::of(Path::new("Lease.PDF")), FileKind::Pdf);
+        assert_eq!(FileKind::of(Path::new("notes.md")), FileKind::Text);
+        assert_eq!(FileKind::of(Path::new("photo.jpeg")), FileKind::Image);
     }
 
     #[test]

@@ -55,6 +55,9 @@ struct SearchArguments {
     /// Print results as JSON, including full chunk text
     #[arg(long)]
     json: bool,
+    /// Show weak results too, instead of only those that stand out from the rest of the index
+    #[arg(long)]
+    all: bool,
     /// Only return this kind of content
     #[arg(long, value_enum)]
     kind: Option<KindFilter>,
@@ -64,6 +67,7 @@ struct SearchArguments {
 enum KindFilter {
     Text,
     Image,
+    Pdf,
 }
 
 impl From<KindFilter> for FileKind {
@@ -71,6 +75,7 @@ impl From<KindFilter> for FileKind {
         match filter {
             KindFilter::Text => FileKind::Text,
             KindFilter::Image => FileKind::Image,
+            KindFilter::Pdf => FileKind::Pdf,
         }
     }
 }
@@ -89,9 +94,9 @@ struct IndexArguments {
     /// Skip text files larger than this many bytes
     #[arg(long, default_value_t = 1024 * 1024)]
     max_file_size: u64,
-    /// Skip images larger than this many bytes
+    /// Skip images and PDFs larger than this many bytes
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
-    max_image_size: u64,
+    max_media_size: u64,
     /// Do not index images (each takes ~5 s on a CPU, well under 1 s with --device cuda)
     #[arg(long)]
     skip_images: bool,
@@ -220,6 +225,7 @@ fn run_search(arguments: &SearchArguments, locations: &Locations) -> Result<()> 
         limit: arguments.limit,
         one_result_per_file: arguments.files_with_matches,
         kind: arguments.kind.map(FileKind::from),
+        relevance_cutoff: !arguments.all,
         ..SearchOptions::default()
     };
     let results = search(&store, &mut encoder, &scope, query, options)?;
@@ -252,7 +258,7 @@ fn run_index(arguments: &IndexArguments, locations: &Locations) -> Result<()> {
     let options = IndexOptions {
         discovery: DiscoveryOptions {
             max_text_size: arguments.max_file_size,
-            max_image_size: arguments.max_image_size,
+            max_media_size: arguments.max_media_size,
             include_images: !arguments.skip_images,
         },
         ..IndexOptions::default()
@@ -286,6 +292,8 @@ fn summary_line(root: &Path, summary: &IndexSummary, dimensions: usize, device: 
         (summary.files_skipped_too_large, "too large"),
         (summary.images_skipped_too_small, "tiny images"),
         (summary.images_unreadable, "unreadable images"),
+        (summary.pdfs_without_text, "PDFs without text (scans need OCR)"),
+        (summary.pdfs_unreadable, "unreadable PDFs"),
     ]
     .into_iter()
     .filter(|(count, _)| *count > 0)
