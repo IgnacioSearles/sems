@@ -36,13 +36,9 @@ pub struct VisionConfig {
 
 impl ModelConfig {
     pub fn load(path: &Path) -> Result<Self, EmbeddingError> {
-        let contents = std::fs::read_to_string(path).map_err(|source| EmbeddingError::ReadFile {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        serde_json::from_str(&contents).map_err(|source| EmbeddingError::InvalidConfig {
-            path: path.to_path_buf(),
-            source,
-        })
+        let contents = std::fs::read_to_string(path)
+            .map_err(|source| EmbeddingError::ReadFile { path: path.to_path_buf(), source })?;
+        serde_json::from_str(&contents)
+            .map_err(|source| EmbeddingError::InvalidConfig { path: path.to_path_buf(), source })
     }
 }

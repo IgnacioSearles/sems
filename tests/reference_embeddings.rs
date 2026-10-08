@@ -3,11 +3,14 @@
 //! so they are ignored by default:
 //!
 //!     SEMS_ONNXRUNTIME=path/to/onnxruntime.dll cargo test --release -- --ignored
+//!
+//! Set SEMS_DEVICE=cuda or SEMS_DEVICE=directml (with the matching ONNX Runtime build) to verify
+//! GPU execution against the same references.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use sems::embedding::{EmbeddingModel, OnnxRuntime, PreprocessedImage};
+use sems::embedding::{EmbeddingModel, ExecutionDevice, OnnxRuntime, PreprocessedImage};
 use serde::Deserialize;
 
 /// Same bar as the Python export check: anything lower indicates a real numerical divergence.
@@ -36,13 +39,18 @@ fn models_directory() -> PathBuf {
 fn runtime() -> OnnxRuntime {
     static RUNTIME: OnceLock<OnnxRuntime> = OnceLock::new();
     *RUNTIME.get_or_init(|| {
-        let library = std::env::var_os("SEMS_ONNXRUNTIME").expect("set SEMS_ONNXRUNTIME to the onnxruntime library path");
+        let library =
+            std::env::var_os("SEMS_ONNXRUNTIME").expect("set SEMS_ONNXRUNTIME to the onnxruntime library path");
         OnnxRuntime::load(Path::new(&library)).expect("failed to load ONNX Runtime")
     })
 }
 
+fn device() -> ExecutionDevice {
+    std::env::var("SEMS_DEVICE").map_or(ExecutionDevice::Cpu, |value| value.parse().expect("invalid SEMS_DEVICE"))
+}
+
 fn load_model() -> EmbeddingModel {
-    EmbeddingModel::load(runtime(), &models_directory().join("onnx")).expect("failed to load model")
+    EmbeddingModel::load(runtime(), &models_directory().join("onnx"), device()).expect("failed to load model")
 }
 
 fn load_references(kind: &str) -> Vec<Reference> {
@@ -53,14 +61,14 @@ fn load_references(kind: &str) -> Vec<Reference> {
 
 fn read_f32_tensor(tensor: &TensorFile) -> Vec<f32> {
     let bytes = std::fs::read(models_directory().join(&tensor.file)).expect("missing tensor file");
-    let values: Vec<f32> = bytes.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).collect();
+    let values: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|&chunk| f32::from_le_bytes(chunk)).collect();
     assert_eq!(values.len(), tensor.shape.iter().product::<usize>());
     values
 }
 
 fn read_i64_tensor(tensor: &TensorFile) -> Vec<i64> {
     let bytes = std::fs::read(models_directory().join(&tensor.file)).expect("missing tensor file");
-    let values: Vec<i64> = bytes.chunks_exact(8).map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap())).collect();
+    let values: Vec<i64> = bytes.as_chunks::<8>().0.iter().map(|&chunk| i64::from_le_bytes(chunk)).collect();
     assert_eq!(values.len(), tensor.shape.iter().product::<usize>());
     values
 }
@@ -80,7 +88,7 @@ fn reference_image(reference: &Reference) -> PreprocessedImage {
     let position_tensor = reference.position_ids.as_ref().expect("image reference without position ids");
     let max_patches = pixel_tensor.shape[1];
     let position_ids = read_i64_tensor(position_tensor);
-    let real_patches = position_ids.chunks_exact(2).filter(|position| position[0] != -1).count();
+    let real_patches = position_ids.as_chunks::<2>().0.iter().filter(|[x, _]| *x != -1).count();
     PreprocessedImage {
         pixel_values: read_f32_tensor(pixel_tensor),
         position_ids,
@@ -121,7 +129,11 @@ fn image_embedding_matches_reference_given_reference_preprocessing() {
         let image = reference_image(&reference);
         assert_eq!(model.image_token_ids(image.soft_token_count), reference.input_ids);
         let embedding = model.embed_preprocessed_image(&image).unwrap();
-        assert_matches_reference(&format!("{} (reference preprocessing)", reference.input), &embedding, &reference.embedding);
+        assert_matches_reference(
+            &format!("{} (reference preprocessing)", reference.input),
+            &embedding,
+            &reference.embedding,
+        );
     }
 }
 
@@ -145,6 +157,10 @@ fn image_embedding_matches_reference_end_to_end() {
         assert!(max_pixel_difference * 255.0 <= 1.0 + 1e-3, "resize diverges from upstream bicubic");
 
         let embedding = model.embed_image(&image).unwrap();
-        assert_matches_reference(&format!("{} (rust preprocessing)", reference.input), &embedding, &reference.embedding);
+        assert_matches_reference(
+            &format!("{} (rust preprocessing)", reference.input),
+            &embedding,
+            &reference.embedding,
+        );
     }
 }

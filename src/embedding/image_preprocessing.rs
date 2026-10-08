@@ -167,9 +167,11 @@ fn resize_bicubic(image: &RgbImage, target: TargetSize) -> Result<RgbImage, Embe
 
     let narrowed: Vec<u8> = destination
         .into_vec()
-        .chunks_exact(2)
-        .map(|bytes| {
-            let value = u32::from(u16::from_ne_bytes([bytes[0], bytes[1]]));
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&bytes| {
+            let value = u32::from(u16::from_ne_bytes(bytes));
             ((value * 255 + 32_767) / 65_535) as u8
         })
         .collect();

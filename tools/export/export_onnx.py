@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnxruntime
 import torch
 from PIL import Image
@@ -169,7 +170,34 @@ def export_graph(module: nn.Module, example_inputs: dict[str, torch.Tensor], dyn
         dynamo=True,
         optimize=True,
     )
+    disable_reshape_allowzero(path)
     print(f"exported {path.name}")
+
+
+def disable_reshape_allowzero(path: Path) -> None:
+    """Rewrites Reshape(allowzero=1) to allowzero=0, which the DirectML provider requires.
+
+    The two only differ when a target-shape entry is literally 0. Constant shapes are checked
+    here; dynamic shapes come from Shape() of non-empty inputs, so they never contain 0.
+    The onnx runtime parity checks that follow cover the rewritten graphs.
+    """
+    model = onnx.load(str(path), load_external_data=False)
+    constant_shapes = {
+        initializer.name: onnx.numpy_helper.to_array(initializer)
+        for initializer in model.graph.initializer
+        if initializer.data_type == onnx.TensorProto.INT64
+        and initializer.data_location != onnx.TensorProto.EXTERNAL
+    }
+    for node in model.graph.node:
+        if node.op_type != "Reshape":
+            continue
+        shape = constant_shapes.get(node.input[1])
+        if shape is not None and (shape == 0).any():
+            raise ValueError(f"{path.name}: {node.name} has a literal 0 in its target shape")
+        for attribute in node.attribute:
+            if attribute.name == "allowzero":
+                attribute.i = 0
+    onnx.save(model, str(path))  # weights stay in the existing external data file
 
 
 def repeat_batch(tensor: torch.Tensor) -> torch.Tensor:

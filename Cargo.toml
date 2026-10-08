@@ -12,7 +12,10 @@ image = "0.25"
 # ort 2.x has not had a stable release yet; pin the exact release candidate.
 # load-dynamic: onnxruntime.dll is loaded from an explicit path at runtime. Static linking needs the
 # VS 2022 STL, and loading by name on Windows can pick up the outdated copy in System32.
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-27"] }
+# api-24 is the minimum ONNX Runtime API we request, not the version we run: newer runtimes still
+# serve it, so CPU and CUDA run on current releases (1.30, CUDA 13, NVIDIA driver 580+). It stays at
+# 24 because 1.24 is the last DirectML release, and sems uses nothing from later API versions.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-24", "cuda", "directml"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

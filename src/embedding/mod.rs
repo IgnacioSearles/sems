@@ -15,8 +15,8 @@ use tokenizers::Tokenizer;
 
 pub use config::ModelConfig;
 pub use image_preprocessing::{ImagePreprocessor, PreprocessedImage};
+pub use onnx::{ExecutionDevice, OnnxRuntime};
 use onnx::{GraphSession, TensorF32};
-pub use onnx::OnnxRuntime;
 
 /// A unit-length embedding vector.
 pub type Embedding = Vec<f32>;
@@ -54,6 +54,7 @@ impl ModelFiles {
 
 pub struct EmbeddingModel {
     runtime: OnnxRuntime,
+    device: ExecutionDevice,
     files: ModelFiles,
     config: ModelConfig,
     tokenizer: Tokenizer,
@@ -67,14 +68,18 @@ pub struct EmbeddingModel {
 impl EmbeddingModel {
     /// Loads the tokenizer and text graphs concurrently: they are independent, and parsing the
     /// 32 MB tokenizer.json takes about as long as creating the text encoder session.
-    pub fn load(runtime: OnnxRuntime, model_directory: &Path) -> Result<Self, EmbeddingError> {
+    ///
+    /// The token embedder always runs on CPU: it is a table lookup, and placing its 512 MB table
+    /// on a 4 GB GPU would only take memory from the encoders.
+    pub fn load(runtime: OnnxRuntime, model_directory: &Path, device: ExecutionDevice) -> Result<Self, EmbeddingError> {
         let files = ModelFiles { directory: model_directory.to_path_buf() };
         let config = ModelConfig::load(&files.path("config.json"))?;
         let (tokenizer, token_embedder, text_encoder) = std::thread::scope(|scope| {
             let tokenizer = scope.spawn(|| load_tokenizer(&files.path("tokenizer.json")));
             let text_encoder =
-                scope.spawn(|| GraphSession::load(runtime, "text_encoder", &files.path("text_encoder.onnx")));
-            let token_embedder = GraphSession::load(runtime, "token_embedder", &files.path("token_embedder.onnx"));
+                scope.spawn(|| GraphSession::load(runtime, "text_encoder", &files.path("text_encoder.onnx"), device));
+            let token_embedder =
+                GraphSession::load(runtime, "token_embedder", &files.path("token_embedder.onnx"), ExecutionDevice::Cpu);
             (join_propagating_panic(tokenizer), token_embedder, join_propagating_panic(text_encoder))
         });
         Ok(Self {
@@ -84,6 +89,7 @@ impl EmbeddingModel {
             vision_encoder: None,
             image_preprocessor: ImagePreprocessor::new(&config.vision_config),
             runtime,
+            device,
             files,
             config,
         })
@@ -149,10 +155,11 @@ impl EmbeddingModel {
     fn encode_vision(&mut self, image: &PreprocessedImage) -> Result<TensorF32, EmbeddingError> {
         if self.vision_encoder.is_none() {
             let path = self.files.path("vision_encoder.onnx");
-            self.vision_encoder = Some(GraphSession::load(self.runtime, "vision_encoder", &path)?);
+            self.vision_encoder = Some(GraphSession::load(self.runtime, "vision_encoder", &path, self.device)?);
         }
         let vision_encoder = self.vision_encoder.as_mut().expect("vision encoder was loaded above");
-        let pixel_values = onnx::tensor_f32(vec![1, image.max_patches, image.patch_pixels], image.pixel_values.clone())?;
+        let pixel_values =
+            onnx::tensor_f32(vec![1, image.max_patches, image.patch_pixels], image.pixel_values.clone())?;
         let position_ids = onnx::tensor_i64(vec![1, image.max_patches, 2], image.position_ids.clone())?;
         let soft_tokens = vision_encoder
             .run_single(vec![("pixel_values", pixel_values), ("position_ids", position_ids)], "soft_tokens")?;

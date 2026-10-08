@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use ort::ep::{CUDA, DirectML};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::{DynValue, Tensor};
@@ -39,13 +40,40 @@ impl OnnxRuntime {
     }
 }
 
+/// Where a graph runs. GPU devices require the matching ONNX Runtime build (onnxruntime-gpu with
+/// CUDA 12 + cuDNN 9 on the DLL search path, or onnxruntime-directml).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionDevice {
+    Cpu,
+    Cuda,
+    DirectMl,
+}
+
+impl std::str::FromStr for ExecutionDevice {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda),
+            "directml" => Ok(Self::DirectMl),
+            other => Err(format!("unknown execution device '{other}' (expected cpu, cuda, or directml)")),
+        }
+    }
+}
+
 pub struct GraphSession {
     name: &'static str,
     session: Session,
 }
 
 impl GraphSession {
-    pub fn load(_runtime: OnnxRuntime, name: &'static str, path: &Path) -> Result<Self, EmbeddingError> {
+    pub fn load(
+        _runtime: OnnxRuntime,
+        name: &'static str,
+        path: &Path,
+        device: ExecutionDevice,
+    ) -> Result<Self, EmbeddingError> {
         let onnx_error = |source: ort::Error| EmbeddingError::Onnx { graph: name, source };
         if !path.is_file() {
             return Err(EmbeddingError::ReadFile {
@@ -53,12 +81,26 @@ impl GraphSession {
                 source: std::io::Error::new(std::io::ErrorKind::NotFound, "model graph not found"),
             });
         }
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .map_err(onnx_error)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|error| onnx_error(error.into()))?
-            .commit_from_file(path)
-            .map_err(onnx_error)?;
+            .map_err(|error| onnx_error(error.into()))?;
+        // error_on_failure: a missing GPU dependency must be an error, not a silent 10x slowdown on CPU.
+        builder = match device {
+            ExecutionDevice::Cpu => builder,
+            ExecutionDevice::Cuda => builder
+                .with_execution_providers([CUDA::default().build().error_on_failure()])
+                .map_err(|error| onnx_error(error.into()))?,
+            ExecutionDevice::DirectMl => builder
+                // DirectML does not support memory patterns or parallel execution.
+                .with_memory_pattern(false)
+                .map_err(|error| onnx_error(error.into()))?
+                .with_parallel_execution(false)
+                .map_err(|error| onnx_error(error.into()))?
+                .with_execution_providers([DirectML::default().build().error_on_failure()])
+                .map_err(|error| onnx_error(error.into()))?,
+        };
+        let session = builder.commit_from_file(path).map_err(onnx_error)?;
         Ok(Self { name, session })
     }
 
