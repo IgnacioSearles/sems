@@ -249,10 +249,12 @@ fn run_index(arguments: &IndexArguments, locations: &Locations) -> Result<()> {
     }
     // Load the model first: a missing runtime should fail before the index is created or cleared.
     let mut encoder = load_encoder(locations, arguments.device)?;
-    let mut store = IndexStore::open(&locations.index_path()?, index_identity())?;
-    if arguments.rebuild {
-        store.clear()?;
-    }
+    let index_path = locations.index_path()?;
+    let mut store = if arguments.rebuild {
+        IndexStore::recreate(&index_path, index_identity())?
+    } else {
+        IndexStore::open(&index_path, index_identity())?
+    };
     let options = IndexOptions { max_file_size: arguments.max_file_size, ..IndexOptions::default() };
     let mut progress = TerminalProgress::new();
     let summary = index_directory(&mut store, &mut encoder, &root, &options, &mut progress)?;

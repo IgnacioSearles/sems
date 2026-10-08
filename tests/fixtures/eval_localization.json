@@ -1,0 +1,87 @@
+[
+  {
+    "query": "turn a title into a url friendly string",
+    "expected": "code/utils.py",
+    "expected_line": 12
+  },
+  {
+    "query": "split a list into groups of n elements",
+    "expected": "code/utils.py",
+    "expected_line": 19
+  },
+  {
+    "query": "parse strings like 1h30m into seconds",
+    "expected": "code/utils.py",
+    "expected_line": 37
+  },
+  {
+    "query": "format a file size like 1.5 MB",
+    "expected": "code/utils.py",
+    "expected_line": 45
+  },
+  {
+    "query": "combine two nested configuration dictionaries",
+    "expected": "code/utils.py",
+    "expected_line": 54
+  },
+  {
+    "query": "edit distance between two strings",
+    "expected": "code/utils.py",
+    "expected_line": 65
+  },
+  {
+    "query": "validate a credit card number checksum",
+    "expected": "code/utils.py",
+    "expected_line": 77
+  },
+  {
+    "query": "load variables from a .env file",
+    "expected": "code/utils.py",
+    "expected_line": 92
+  },
+  {
+    "query": "compute the 95th percentile of latencies",
+    "expected": "code/utils.py",
+    "expected_line": 108
+  },
+  {
+    "query": "how many vacation days do I get per year",
+    "expected": "docs/handbook.md",
+    "expected_line": 13
+  },
+  {
+    "query": "do I need a doctor's note when I'm ill",
+    "expected": "docs/handbook.md",
+    "expected_line": 20
+  },
+  {
+    "query": "maternity and paternity leave",
+    "expected": "docs/handbook.md",
+    "expected_line": 24
+  },
+  {
+    "query": "can I work from another country for a while",
+    "expected": "docs/handbook.md",
+    "expected_line": 30
+  },
+  {
+    "query": "will the company pay for my desk and chair",
+    "expected": "docs/handbook.md",
+    "expected_line": 34
+  },
+  {
+    "query": "is a dinner with a customer reimbursed",
+    "expected": "docs/handbook.md",
+    "expected_line": 40
+  },
+  {
+    "query": "rules for two factor authentication",
+    "expected": "docs/handbook.md",
+    "expected_line": 46
+  },
+  {
+    "query": "budget for attending conferences and courses",
+    "expected": "docs/handbook.md",
+    "expected_line": 51
+  }
+]

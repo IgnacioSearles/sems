@@ -3,14 +3,23 @@
 Semantic search for local files — like `grep`, but it matches meaning instead of exact text.
 
 ```console
-$ sems index ~/projects/shop
-indexed /home/me/projects/shop: 1,204 files (0 unchanged, 1,204 embedded into 5,310 chunks, 0 removed) in 41.2s [256d]
+> sems index --device cuda
+indexed C:\...\sems: 46 files (0 unchanged, 45 embedded into 711 chunks, 0 removed, skipped 1 binary) in 14.1s [256d]
 
-$ sems "try again with increasing delays when a request fails" ~/projects/shop
-src/http/retry.ts:1-15  0.71
-    export async function fetchWithBackoff(url: string, attempts = 5): Promise<Response> {
-      let delayMs = 250;
+> sems -n 1 "how is the dll search path set for cudnn"
+src\embedding\onnx.rs:46-67  0.82
+46: /// Makes `directory` part of the DLL search order for libraries loaded by name.
+47: ///
+48: /// ONNX Runtime's CUDA provider loads cuDNN with a bare `LoadLibrary("cudnn64_9.dll")` at first
+...
+52: #[cfg(windows)]
+53: fn search_directory_for_dependencies(directory: &Path) -> std::io::Result<()> {
+...
 ```
+
+Each result is the matching unit — a function, a markdown section, a paragraph — shown in full
+with line numbers. Files are split at their own structure (blank lines before less-indented
+code, headings), so results point at the lines that matched rather than a fixed-size window.
 
 Powered by [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2), running locally on
 ONNX Runtime. Nothing leaves your machine.

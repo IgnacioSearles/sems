@@ -169,15 +169,21 @@ impl IndexStore {
         Ok(())
     }
 
-    /// Deletes every file and chunk, keeping the schema. Used by `--rebuild`.
-    pub fn clear(&mut self) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        transaction.execute_batch(
-            "DELETE FROM chunks; DELETE FROM files; DELETE FROM metadata;
-             INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild');",
-        )?;
-        transaction.commit()?;
-        self.verify_identity()
+    /// Deletes the index at `path` and creates an empty one. Used by `--rebuild`, which must work
+    /// precisely when the existing index is incompatible (other encoder, chunker or schema), so the
+    /// old file is removed rather than opened.
+    pub fn recreate(path: &Path, identity: IndexIdentity) -> Result<Self> {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            match std::fs::remove_file(&file) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error).with_context(|| format!("failed to delete {}", Path::new(&file).display()));
+                }
+                _ => {}
+            }
+        }
+        Self::open(path, identity)
     }
 
     pub fn files_in_scope(&self, scope: &PathScope) -> Result<HashMap<PathBuf, FileRecord>> {
@@ -460,8 +466,23 @@ mod tests {
         let path = directory.path().join("index.db");
         drop(IndexStore::open(&path, identity()).unwrap());
         let other = IndexIdentity { dimensions: 3, ..identity() };
-        let error = IndexStore::open(&path, other).err().expect("identity mismatch must fail").to_string();
+        let error = IndexStore::open(&path, other.clone()).err().expect("identity mismatch must fail").to_string();
         assert!(error.contains("--rebuild"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn recreate_replaces_an_incompatible_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("index.db");
+        let mut old = IndexStore::open(&path, identity()).unwrap();
+        old.replace_file(&root().join("old.txt"), &record(1), &[chunk("stale", [1.0, 0.0])]).unwrap();
+        drop(old);
+
+        let other = IndexIdentity { chunker_version: 2, ..identity() };
+        let store = IndexStore::recreate(&path, other.clone()).unwrap();
+        assert_eq!(store.statistics(&PathScope::new(&root())).unwrap().files, 0);
+        drop(store);
+        assert!(IndexStore::open(&path, other).is_ok(), "recreated index carries the new identity");
     }
 
     #[test]

@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 
 use crate::search::SearchResult;
 
-/// Lines of chunk text shown under each result.
-const PREVIEW_LINES: usize = 3;
-const PREVIEW_MAX_CHARACTERS: usize = 120;
+/// Longer lines (minified code, long prose lines) are cut so one result cannot flood the screen.
+const MAX_LINE_CHARACTERS: usize = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// `path:start-end  similarity` followed by a short preview.
+    /// `path:start-end  similarity` followed by the matched lines, numbered.
     Text,
     /// One path per line, best first, without duplicates (like `grep -l`).
     FilesWithMatches,
@@ -39,15 +38,26 @@ pub fn render(results: &[SearchResult], format: OutputFormat, style: Style, work
     }
 }
 
+/// Each result is its whole chunk (one function or section, at most a few dozen lines), so the
+/// lines that matched are shown in full rather than a preview of the chunk's start.
 fn render_text(results: &[SearchResult], style: Style, working_directory: &Path) -> String {
     let mut output = String::new();
-    for result in results {
+    for (index, result) in results.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
         // Colors follow ripgrep: magenta paths, green line numbers.
         let path = style.paint("35", &display_path(&result.path, working_directory));
         let lines = style.paint("32", &format!("{}-{}", result.start_line, result.end_line));
         writeln!(output, "{path}:{lines}  {}", style.paint("2", &format!("{:.2}", result.similarity))).unwrap();
-        for line in preview(&result.text) {
-            writeln!(output, "    {line}").unwrap();
+        let width = result.end_line.to_string().len();
+        for (line_number, line) in numbered_lines(result) {
+            let gutter = style.paint("32", &format!("{line_number:>width$}"));
+            if line.is_empty() {
+                writeln!(output, "{gutter}:").unwrap();
+            } else {
+                writeln!(output, "{gutter}: {line}").unwrap();
+            }
         }
     }
     output
@@ -74,21 +84,27 @@ pub fn display_path(path: &Path, working_directory: &Path) -> String {
     }
 }
 
-/// First non-blank lines of a chunk, with their shared indentation removed so code structure
-/// stays visible without drifting to the right.
-fn preview(text: &str) -> Vec<String> {
-    let lines: Vec<&str> =
-        text.lines().map(str::trim_end).filter(|line| !line.is_empty()).take(PREVIEW_LINES).collect();
-    let shared_indent = lines.iter().map(|line| line.len() - line.trim_start().len()).min().unwrap_or(0);
+/// The chunk's lines with their line numbers, minus the indentation they all share so nested code
+/// does not drift right. Overlong lines are cut on a character boundary.
+fn numbered_lines(result: &SearchResult) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = result.text.lines().map(str::trim_end).collect();
+    let shared_indent = lines
+        .iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
     lines
         .iter()
-        .map(|line| {
+        .enumerate()
+        .map(|(offset, line)| {
             // Indentation is ASCII whitespace, so byte slicing stays on a char boundary.
-            let line = &line[shared_indent..];
-            match line.char_indices().nth(PREVIEW_MAX_CHARACTERS) {
+            let line = line.get(shared_indent..).unwrap_or("");
+            let line = match line.char_indices().nth(MAX_LINE_CHARACTERS) {
                 Some((cut, _)) => format!("{}…", &line[..cut]),
                 None => line.to_string(),
-            }
+            };
+            (result.start_line + offset, line)
         })
         .collect()
 }
@@ -101,7 +117,7 @@ mod tests {
         SearchResult {
             path: PathBuf::from(path),
             start_line,
-            end_line: start_line + 1,
+            end_line: start_line + text.lines().count().max(1) - 1,
             similarity: 0.5,
             text: text.into(),
         }
@@ -112,20 +128,19 @@ mod tests {
     }
 
     #[test]
-    fn text_output_shows_location_score_and_preview() {
+    fn text_output_shows_every_matched_line_numbered() {
         let path = working_directory().join("src").join("main.rs");
-        let results = [result(path.to_str().unwrap(), 3, "\n  fn main() {\n\n      run();\n  }\n  // tail")];
+        let results = [
+            result(path.to_str().unwrap(), 9, "    fn main() {\n\n        run();\n    }"),
+            result("other.txt", 1, "note"),
+        ];
         let output = render(&results, OutputFormat::Text, Style { color: false }, &working_directory());
         let expected_path = Path::new("src").join("main.rs");
-        assert_eq!(
-            output,
-            format!("{}:3-4  0.50\n    fn main() {{\n        run();\n    }}\n", expected_path.display())
+        let expected = format!(
+            "{}:9-12  0.50\n 9: fn main() {{\n10:\n11:     run();\n12: }}\n\nother.txt:1-1  0.50\n1: note\n",
+            expected_path.display()
         );
-    }
-
-    #[test]
-    fn preview_keeps_relative_indentation() {
-        assert_eq!(preview("        if ready {\n            go();\n        }"), ["if ready {", "    go();", "}"]);
+        assert_eq!(output, expected);
     }
 
     #[test]
@@ -136,9 +151,9 @@ mod tests {
     }
 
     #[test]
-    fn long_preview_lines_are_cut_on_character_boundaries() {
-        let lines = preview(&"é".repeat(200));
-        assert_eq!(lines[0].chars().count(), PREVIEW_MAX_CHARACTERS + 1);
+    fn long_lines_are_cut_on_character_boundaries() {
+        let lines = numbered_lines(&result("a.txt", 1, &"é".repeat(500)));
+        assert_eq!(lines[0].1.chars().count(), MAX_LINE_CHARACTERS + 1);
     }
 
     #[test]
