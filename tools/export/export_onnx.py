@@ -14,7 +14,8 @@ normalization (sentence-transformers modules 1 and 2) are folded into text_encod
 
 Every graph is verified against the reference embeddings produced by make_reference.py, first as
 PyTorch wrappers (proves the decomposition is faithful) and then through ONNX Runtime (proves the
-export is faithful).
+export is faithful). Finally the weights are stored in float16 (half_precision.py), halving the
+download, and the graphs that ship are verified again.
 
 Usage:
     python export_onnx.py --model ../../models/embeddinggemma-2 --out ../../models/onnx \
@@ -38,6 +39,7 @@ from torch import nn
 # Sibling module shared with make_reference.py; added explicitly so `python -I` (no script directory
 # on sys.path) works too.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from half_precision import convert_directory  # noqa: E402
 from media_decoding import decode_audio, decode_video_frames  # noqa: E402
 
 MINIMUM_COSINE_SIMILARITY = 0.9999
@@ -438,13 +440,25 @@ def main() -> None:
     verify(decomposition, media_cases, "torch decomposition, audio and video")
     image_case = next(case for case in cases if "pixel_values" in case["features"])
     audio_case = next(case for case in media_cases if "input_features" in case["features"])
-    export_all(modules, image_case["features"], audio_case["features"], arguments.out)
+    # Full-precision graphs go to a staging directory: verified there, then converted into --out.
+    full_precision = arguments.out.with_name(arguments.out.name + ".float32")
+    shutil.rmtree(full_precision, ignore_errors=True)
+    export_all(modules, image_case["features"], audio_case["features"], full_precision)
     for file_name in RUNTIME_FILES:
-        shutil.copy2(arguments.model / file_name, arguments.out / file_name)
-    exported = onnx_pipeline(arguments.out, token_ids)
-    verify(exported, cases, "onnx runtime")
-    verify(exported, budget_cases, "onnx runtime, other token budgets")
-    verify(exported, media_cases, "onnx runtime, audio and video")
+        shutil.copy2(arguments.model / file_name, full_precision / file_name)
+    verify_onnx(model, onnx_pipeline(full_precision, token_ids), cases, budget_cases, media_cases, "float32")
+
+    shutil.rmtree(arguments.out, ignore_errors=True)
+    convert_directory(full_precision, arguments.out, RUNTIME_FILES)
+    verify_onnx(model, onnx_pipeline(arguments.out, token_ids), cases, budget_cases, media_cases, "float16 weights")
+    shutil.rmtree(full_precision)
+
+
+def verify_onnx(model: SentenceTransformer, exported: Pipeline, cases: list[dict], budget_cases: list[dict],
+                media_cases: list[dict], variant: str) -> None:
+    verify(exported, cases, f"onnx runtime, {variant}")
+    verify(exported, budget_cases, f"onnx runtime, {variant}, other token budgets")
+    verify(exported, media_cases, f"onnx runtime, {variant}, audio and video")
     verify_generalization(model, exported)
 
 

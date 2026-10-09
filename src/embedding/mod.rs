@@ -256,7 +256,8 @@ impl EmbeddingModel {
             // Release the vision encoder first: see the `audio_encoder` field.
             self.vision_encoder = None;
             let path = self.files.path("audio_encoder.onnx");
-            self.audio_encoder = Some(GraphSession::load(self.runtime, "audio_encoder", &path, self.device)?);
+            let device = audio_encoder_device(self.device);
+            self.audio_encoder = Some(GraphSession::load(self.runtime, "audio_encoder", &path, device)?);
         }
         let audio_encoder = self.audio_encoder.as_mut().expect("audio encoder was loaded above");
         // The graph takes a fixed 30 s window (see tools/export/export_onnx.py, AUDIO_FRAMES); shorter
@@ -340,6 +341,19 @@ impl EmbeddingModel {
             });
         }
         Ok(pooled.data.chunks_exact(dimensions).map(<[f32]>::to_vec).collect())
+    }
+}
+
+/// Where the audio encoder runs for a model loaded on `device`.
+///
+/// DirectML (ONNX Runtime 1.24) cannot load the audio encoder at all: creating one of its kernels
+/// fails with E_INVALIDARG ("The parameter is incorrect") at every optimization level, in both the
+/// float32 and float16-weight exports. It runs on the CPU instead (~2.8 s per 30 s window, versus
+/// ~0.5 s with CUDA); text and vision stay on the GPU.
+fn audio_encoder_device(device: ExecutionDevice) -> ExecutionDevice {
+    match device {
+        ExecutionDevice::DirectMl => ExecutionDevice::Cpu,
+        other => other,
     }
 }
 

@@ -155,7 +155,7 @@ function Install-Model {
     if (-not (Test-CompleteModel $exportedModel)) {
         throw "No complete exported model in $exportedModel. Export it first (see README, Setup step 1), then run this script again."
     }
-    Write-Host 'Copying the model (~2.9 GB)...'
+    Write-Host 'Copying the model (~1.5 GB)...'
     New-Item -ItemType Directory -Force -Path $installedModel | Out-Null
     Copy-Item -Path (Join-Path $exportedModel '*') -Destination $installedModel -Force
 }
