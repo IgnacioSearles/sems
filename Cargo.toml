@@ -1,6 +1,6 @@
 [package]
 name = "sems"
-version = "0.1.0-rc.1"
+version = "0.1.0"
 edition = "2024"
 description = "Semantic search for local files, powered by EmbeddingGemma 2"
 license = "Apache-2.0"
