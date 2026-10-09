@@ -4,6 +4,7 @@
 //! token ids -> token embeddings, image patches -> soft tokens, and embeddings -> pooled vector.
 //! This module tokenizes, splices image soft tokens into placeholder positions, and runs them.
 
+mod audio_features;
 mod config;
 mod image_preprocessing;
 mod onnx;
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use image::DynamicImage;
 use tokenizers::Tokenizer;
 
+pub use audio_features::{AudioFeatureExtractor, AudioFeatures};
 pub use config::ModelConfig;
 pub use image_preprocessing::{ImagePreprocessor, PreprocessedImage, SUPPORTED_VISION_TOKEN_BUDGETS};
 pub use onnx::{ExecutionDevice, OnnxRuntime};
@@ -33,6 +35,8 @@ pub enum EmbeddingError {
     Tokenization(String),
     #[error("invalid image: {0}")]
     InvalidImage(String),
+    #[error("invalid audio: {0}")]
+    InvalidAudio(String),
     #[error("failed to load ONNX Runtime from {path}: {message}")]
     RuntimeLibrary { path: PathBuf, message: String },
     #[error("onnx runtime error in {graph}: {source}")]
@@ -60,9 +64,15 @@ pub struct EmbeddingModel {
     tokenizer: Tokenizer,
     token_embedder: GraphSession,
     text_encoder: GraphSession,
-    /// Loaded on first image request so text-only use (every search query) never pays for it.
+    /// Loaded on first image or video request so text-only use (every search query) never pays for it.
     vision_encoder: Option<GraphSession>,
+    /// Loaded on first audio request, for the same reason. At most one of the vision and audio
+    /// encoders is resident: with both (1.9 GB of weights plus the text model) a 4 GB GPU spills to
+    /// shared memory and everything slows down (video measured 10x slower, audio 5x). Callers that
+    /// mix modalities should group work by encoder, as the indexer does, so each loads once.
+    audio_encoder: Option<GraphSession>,
     image_preprocessor: ImagePreprocessor,
+    audio_feature_extractor: AudioFeatureExtractor,
 }
 
 impl EmbeddingModel {
@@ -87,7 +97,9 @@ impl EmbeddingModel {
             token_embedder: token_embedder?,
             text_encoder: text_encoder?,
             vision_encoder: None,
+            audio_encoder: None,
             image_preprocessor: ImagePreprocessor::new(&config.vision_config),
+            audio_feature_extractor: AudioFeatureExtractor::new(),
             runtime,
             device,
             files,
@@ -166,6 +178,102 @@ impl EmbeddingModel {
         self.encode(inputs_embeds, &batch)
     }
 
+    /// Embeds video frames (sampled by the caller) as one clip, in the same space as text.
+    /// Frames are preprocessed like images, with the same token budget.
+    pub fn embed_video(&mut self, frames: &[DynamicImage]) -> Result<Embedding, EmbeddingError> {
+        if frames.is_empty() {
+            return Err(EmbeddingError::InvalidImage("a video clip needs at least one frame".into()));
+        }
+        let preprocessor = &self.image_preprocessor;
+        let preprocessed: Vec<PreprocessedImage> = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                frames.iter().map(|frame| scope.spawn(move || preprocessor.preprocess(frame))).collect();
+            handles.into_iter().map(join_propagating_panic).collect::<Result<_, _>>()
+        })?;
+        self.embed_preprocessed_video(&preprocessed)
+    }
+
+    /// Exposed separately so tests can feed reference preprocessing and isolate the model stages.
+    pub fn embed_preprocessed_video(&mut self, frames: &[PreprocessedImage]) -> Result<Embedding, EmbeddingError> {
+        if frames.is_empty() {
+            return Err(EmbeddingError::InvalidImage("a video clip needs at least one frame".into()));
+        }
+        let token_ids = self.video_token_ids(frames);
+        let batch = PaddedBatch::new(std::slice::from_ref(&token_ids), self.config.text_config.pad_token_id);
+        let mut inputs_embeds = self.embed_tokens(&batch)?;
+        // One frame per vision call: batching frames is slower on small GPUs (each frame's attention
+        // matrices compete for memory, measured 3 frames at 10.9 s batched on a 4 GB GPU) and no
+        // faster on a CPU.
+        let mut soft_tokens = TensorF32 { shape: vec![0, self.config.text_config.hidden_size], data: Vec::new() };
+        for frame in frames {
+            let frame_tokens = self.encode_vision(std::slice::from_ref(frame))?;
+            soft_tokens.shape[0] += frame_tokens.shape[0];
+            soft_tokens.data.extend(frame_tokens.data);
+        }
+        splice_soft_tokens(&mut inputs_embeds, &token_ids, self.config.video_token_id, &soft_tokens)?;
+        Ok(self.encode(inputs_embeds, &batch)?.remove(0))
+    }
+
+    /// `[BOS]`, then `[BOI] <video>×n [EOI]` per frame, then `[EOS]`, as the upstream processor builds
+    /// it without timestamps.
+    fn video_token_ids(&self, frames: &[PreprocessedImage]) -> Vec<i64> {
+        let text = &self.config.text_config;
+        let mut ids = vec![text.bos_token_id];
+        for frame in frames {
+            ids.push(self.config.boi_token_id);
+            ids.extend(std::iter::repeat_n(self.config.video_token_id, frame.soft_token_count));
+            ids.push(self.config.eoi_token_id);
+        }
+        ids.push(text.eos_token_id);
+        ids
+    }
+
+    /// Embeds up to 30 seconds of mono 16 kHz audio (longer input is truncated, as upstream does).
+    pub fn embed_audio(&mut self, samples: &[f32]) -> Result<Embedding, EmbeddingError> {
+        let features = self.audio_feature_extractor.extract(samples);
+        self.embed_audio_features(&features)
+    }
+
+    /// Exposed separately so tests can feed reference features and isolate the model stages.
+    pub fn embed_audio_features(&mut self, features: &AudioFeatures) -> Result<Embedding, EmbeddingError> {
+        if !features.mask.contains(&1) {
+            return Err(EmbeddingError::InvalidAudio("clip is too short to produce any features".into()));
+        }
+        let soft_tokens = self.encode_audio(features)?;
+        let text = &self.config.text_config;
+        let mut token_ids = vec![text.bos_token_id, self.config.boa_token_id];
+        // One placeholder per soft token the encoder actually produced (25 per second of audio).
+        token_ids.extend(std::iter::repeat_n(self.config.audio_token_id, soft_tokens.shape[0]));
+        token_ids.extend([self.config.eoa_token_id, text.eos_token_id]);
+        let batch = PaddedBatch::new(std::slice::from_ref(&token_ids), text.pad_token_id);
+        let mut inputs_embeds = self.embed_tokens(&batch)?;
+        splice_soft_tokens(&mut inputs_embeds, &token_ids, self.config.audio_token_id, &soft_tokens)?;
+        Ok(self.encode(inputs_embeds, &batch)?.remove(0))
+    }
+
+    fn encode_audio(&mut self, features: &AudioFeatures) -> Result<TensorF32, EmbeddingError> {
+        if self.audio_encoder.is_none() {
+            // Release the vision encoder first: see the `audio_encoder` field.
+            self.vision_encoder = None;
+            let path = self.files.path("audio_encoder.onnx");
+            self.audio_encoder = Some(GraphSession::load(self.runtime, "audio_encoder", &path, self.device)?);
+        }
+        let audio_encoder = self.audio_encoder.as_mut().expect("audio encoder was loaded above");
+        // The graph takes a fixed 30 s window (see tools/export/export_onnx.py, AUDIO_FRAMES); shorter
+        // clips are zero-padded with the padding masked out, which leaves their soft tokens unchanged.
+        let frames = AudioFeatures::WINDOW_FRAMES;
+        if features.frames > frames {
+            return Err(EmbeddingError::InvalidAudio(format!("{} mel frames exceed the 30 s window", features.frames)));
+        }
+        let mut padded_features = features.features.clone();
+        padded_features.resize(frames * AudioFeatures::MEL_BINS, 0.0);
+        let mut padded_mask = features.mask.clone();
+        padded_mask.resize(frames, 0);
+        let input_features = onnx::tensor_f32(vec![1, frames, AudioFeatures::MEL_BINS], padded_features)?;
+        let mask = onnx::tensor_i64(vec![1, frames], padded_mask)?;
+        audio_encoder.run_single(vec![("input_features", input_features), ("input_features_mask", mask)], "soft_tokens")
+    }
+
     /// `[BOS] [BOI] <image>×n [EOI] [EOS]`, exactly as the upstream processor builds it.
     pub fn image_token_ids(&self, soft_token_count: usize) -> Vec<i64> {
         let text = &self.config.text_config;
@@ -196,6 +304,8 @@ impl EmbeddingModel {
             return Err(EmbeddingError::InvalidImage("images in one batch must share a patch budget".into()));
         }
         if self.vision_encoder.is_none() {
+            // Release the audio encoder first: see the `audio_encoder` field.
+            self.audio_encoder = None;
             let path = self.files.path("vision_encoder.onnx");
             self.vision_encoder = Some(GraphSession::load(self.runtime, "vision_encoder", &path, self.device)?);
         }

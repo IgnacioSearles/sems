@@ -12,12 +12,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::discovery::FileKind;
 use crate::encoder::Encoder;
-use crate::store::{IndexStore, PathScope};
+use crate::segments::TimeSpan;
+use crate::store::{ChunkRecord, IndexStore, PathScope};
 
 /// Candidates taken from each retriever before fusion.
 const CANDIDATES_PER_RETRIEVER: usize = 100;
@@ -38,7 +39,7 @@ pub struct SearchOptions {
     pub keyword_weight: f32,
     /// Keep only each file's best chunk, so `limit` counts files (for `sems -l`).
     pub one_result_per_file: bool,
-    /// Restrict results to text or to images; `None` searches both.
+    /// Restrict results to one kind of file; `None` searches all.
     pub kind: Option<FileKind>,
     /// Drop results below the similarity cliff (see [`relevance_floor`]); `sems --all` turns
     /// this off.
@@ -78,6 +79,47 @@ pub enum ResultContent {
         end_line: usize,
         text: String,
     },
+    /// A stretch of an audio file.
+    Audio { start_seconds: f64, end_seconds: f64 },
+    /// A stretch of a video file, matched by its frames or its soundtrack.
+    Video { start_seconds: f64, end_seconds: f64 },
+}
+
+impl ResultContent {
+    fn from_chunk(chunk: ChunkRecord) -> Result<Self> {
+        let seconds = |span: Option<TimeSpan>| {
+            let span = span.with_context(|| format!("recording chunk of {} has no time span", chunk.path.display()))?;
+            anyhow::Ok((span.start_seconds(), span.end_seconds()))
+        };
+        Ok(match chunk.kind {
+            FileKind::Text => Self::Text { start_line: chunk.start_line, end_line: chunk.end_line, text: chunk.text },
+            FileKind::Image => Self::Image,
+            FileKind::Pdf => Self::Pdf {
+                page: chunk.page.unwrap_or(1),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                text: chunk.text,
+            },
+            FileKind::Audio => {
+                let (start_seconds, end_seconds) = seconds(chunk.time_span)?;
+                Self::Audio { start_seconds, end_seconds }
+            }
+            FileKind::Video => {
+                let (start_seconds, end_seconds) = seconds(chunk.time_span)?;
+                Self::Video { start_seconds, end_seconds }
+            }
+        })
+    }
+
+    /// The stretch of a recording this result covers.
+    pub fn time_span(&self) -> Option<TimeSpan> {
+        match *self {
+            Self::Audio { start_seconds, end_seconds } | Self::Video { start_seconds, end_seconds } => {
+                Some(TimeSpan::from_seconds(start_seconds, end_seconds))
+            }
+            Self::Text { .. } | Self::Image | Self::Pdf { .. } => None,
+        }
+    }
 }
 
 pub fn search(
@@ -90,11 +132,10 @@ pub fn search(
     let query_vector = encoder.encode_query(query)?;
     let (semantic, background) =
         store.nearest_chunks_with_background(scope, &query_vector, CANDIDATES_PER_RETRIEVER, options.kind)?;
-    // Images carry no text, so keyword retrieval only ever contributes text chunks.
+    // Images and recordings carry no text, so keyword retrieval only ever contributes text chunks.
+    let has_text = options.kind.is_none_or(|kind| matches!(kind, FileKind::Text | FileKind::Pdf));
     let keyword = match keyword_query(query) {
-        Some(fts_query) if options.kind != Some(FileKind::Image) => {
-            store.keyword_chunks(scope, &fts_query, CANDIDATES_PER_RETRIEVER)?
-        }
+        Some(fts_query) if has_text => store.keyword_chunks(scope, &fts_query, CANDIDATES_PER_RETRIEVER)?,
         _ => Vec::new(),
     };
 
@@ -109,26 +150,16 @@ pub fn search(
             break;
         }
         let chunk = store.chunk(chunk_id)?;
-        let content = match chunk.kind {
-            FileKind::Text => {
-                ResultContent::Text { start_line: chunk.start_line, end_line: chunk.end_line, text: chunk.text }
-            }
-            FileKind::Image => ResultContent::Image,
-            FileKind::Pdf => ResultContent::Pdf {
-                page: chunk.page.unwrap_or(1),
-                start_line: chunk.start_line,
-                end_line: chunk.end_line,
-                text: chunk.text,
-            },
-        };
         let similarity = dot_product(&query_vector, &chunk.embedding);
+        let path = chunk.path.clone();
+        let content = ResultContent::from_chunk(chunk)?;
         // Exact keyword matches are evidence on their own, and the best result always shows.
         let below_floor = floor.is_some_and(|floor| similarity < floor);
         let matched_every_keyword = keyword.iter().any(|(id, _)| *id == chunk_id);
         if below_floor && !matched_every_keyword && !results.is_empty() {
             continue;
         }
-        let candidate = SearchResult { similarity, path: chunk.path, content };
+        let candidate = SearchResult { similarity, path, content };
         // Chunks overlap by design; a lower-ranked neighbour would mostly repeat a better result.
         let redundant = if options.one_result_per_file {
             results.iter().any(|kept| kept.path == candidate.path)
@@ -155,7 +186,10 @@ fn overlaps(left: &SearchResult, right: &SearchResult) -> bool {
             ResultContent::Pdf { page: left_page, start_line: left_start, end_line: left_end, .. },
             ResultContent::Pdf { page: right_page, start_line: right_start, end_line: right_end, .. },
         ) => left_page == right_page && left_start <= right_end && right_start <= left_end,
-        _ => true,
+        (left_content, right_content) => match (left_content.time_span(), right_content.time_span()) {
+            (Some(left_span), Some(right_span)) => left_span.overlaps(&right_span),
+            _ => true,
+        },
     }
 }
 
@@ -246,6 +280,17 @@ mod tests {
         assert!(overlaps(&result("a", 1, 60), &result("a", 49, 108)));
         assert!(!overlaps(&result("a", 1, 60), &result("a", 61, 120)));
         assert!(!overlaps(&result("a", 1, 60), &result("b", 1, 60)));
+    }
+
+    #[test]
+    fn recording_results_overlap_only_when_their_times_do() {
+        let segment = |start_seconds, end_seconds| SearchResult {
+            path: PathBuf::from("clip.mp4"),
+            similarity: 0.0,
+            content: ResultContent::Video { start_seconds, end_seconds },
+        };
+        assert!(overlaps(&segment(0.0, 9.0), &segment(0.0, 30.0)), "frames and soundtrack of one moment");
+        assert!(!overlaps(&segment(0.0, 9.0), &segment(9.0, 18.0)));
     }
 
     #[test]

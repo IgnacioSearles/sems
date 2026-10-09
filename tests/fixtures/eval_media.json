@@ -1,0 +1,50 @@
+[
+  {
+    "query": "buy milk and eggs",
+    "expected": "audio/memo_0001.wav",
+    "expected_seconds": 3.0
+  },
+  {
+    "query": "vote on the next song at a party",
+    "expected": "audio/memo_0002.mp3",
+    "expected_seconds": 4.0
+  },
+  {
+    "query": "the car needs new tires and brakes",
+    "expected": "audio/memo_0003.m4a",
+    "expected_seconds": 4.89
+  },
+  {
+    "query": "reschedule my dentist appointment",
+    "expected": "audio/memo_0003.m4a",
+    "expected_seconds": 15.84
+  },
+  {
+    "query": "birthday present ideas for my mother",
+    "expected": "audio/memo_0003.m4a",
+    "expected_seconds": 26.65
+  },
+  {
+    "query": "how to move a plant into a bigger pot",
+    "expected": "videos/clip_0001.mp4",
+    "expected_seconds": 6.11
+  },
+  {
+    "query": "a cat",
+    "expected": "videos/clip_0001.mp4",
+    "expected_seconds": 4.0,
+    "kind": "video"
+  },
+  {
+    "query": "a rocket launch",
+    "expected": "videos/clip_0001.mp4",
+    "expected_seconds": 12.0,
+    "kind": "video"
+  },
+  {
+    "query": "a cup of coffee",
+    "expected": "videos/clip_0001.mp4",
+    "expected_seconds": 20.0,
+    "kind": "video"
+  }
+]

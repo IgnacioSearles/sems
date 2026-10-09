@@ -2,7 +2,11 @@
 
     token_embedder.onnx   input_ids [B,T] int64                      -> inputs_embeds [B,T,512]
     vision_encoder.onnx   pixel_values [N,P,768], position_ids [N,P,2] -> soft_tokens [S,512]
+    audio_encoder.onnx    input_features [1,3000,128], input_features_mask [1,3000] int64 -> soft_tokens [S,512]
     text_encoder.onnx     inputs_embeds [B,T,512], attention_mask [B,T] -> embedding [B,768] (L2-normalized)
+
+Video frames use the vision encoder; their soft tokens fill <|video|> placeholders instead of
+<|image|>. Audio soft tokens fill <|audio|> placeholders.
 
 The split mirrors EmbeddingGemma2Model.forward: Rust tokenizes, embeds tokens, splices vision soft
 tokens into the multimodal placeholder positions, then runs the text encoder. Mean pooling and
@@ -31,10 +35,20 @@ from PIL import Image
 from sentence_transformers import SentenceTransformer
 from torch import nn
 
+# Sibling module shared with make_reference.py; added explicitly so `python -I` (no script directory
+# on sys.path) works too.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from media_decoding import decode_audio, decode_video_frames  # noqa: E402
+
 MINIMUM_COSINE_SIMILARITY = 0.9999
 # Smaller vision token budgets than the default 280 that the runtime may use; verified explicitly.
 ALTERNATIVE_VISION_TOKEN_BUDGETS = (140, 70)
 ONNX_OPSET = 20
+# The audio graph takes a fixed 3000 mel frames: the model's 30 s cap. With a dynamic length, the
+# exporter's symbolic shape simplification (sympy) on the conformer's chunked attention masks ran for
+# over 20 minutes without finishing. Shorter clips are zero-padded and masked; verify() compares the
+# padded ONNX path against the official unpadded embeddings.
+AUDIO_FRAMES = 3000
 # Non-graph files the Rust runtime reads from the model directory.
 RUNTIME_FILES = ("tokenizer.json", "config.json")
 
@@ -67,6 +81,21 @@ class VisionEncoder(nn.Module):
         return self.embed_vision(inputs_embeds=hidden_states)
 
 
+class AudioEncoder(nn.Module):
+    """Audio tower plus projection into the text model's space, padding stripped (like vision)."""
+
+    def __init__(self, audio_tower: nn.Module, embed_audio: nn.Module):
+        super().__init__()
+        self.audio_tower = audio_tower
+        self.embed_audio = embed_audio
+
+    def forward(self, input_features: torch.Tensor, input_features_mask: torch.Tensor) -> torch.Tensor:
+        # An int64 mask keeps the runtime side simple; the tower expects booleans.
+        output = self.audio_tower(input_features, input_features_mask != 0, return_dict=True)
+        soft_tokens = self.embed_audio(inputs_embeds=output.last_hidden_state)
+        return soft_tokens[output.attention_mask]
+
+
 class TextEncoder(nn.Module):
     def __init__(self, language_model: nn.Module):
         super().__init__()
@@ -80,24 +109,45 @@ class TextEncoder(nn.Module):
 
 
 class Pipeline:
-    """Runs the three-stage decomposition with interchangeable backends (torch modules or ORT sessions)."""
+    """Runs the decomposition with interchangeable backends (torch modules or ORT sessions)."""
 
-    def __init__(self, embed_tokens, encode_vision, encode_text, image_token_id: int):
+    def __init__(self, embed_tokens, encode_vision, encode_audio, encode_text, token_ids: dict[str, int]):
         self.embed_tokens = embed_tokens
         self.encode_vision = encode_vision
+        self.encode_audio = encode_audio
         self.encode_text = encode_text
-        self.image_token_id = image_token_id
+        self.token_ids = token_ids
 
     def embed(self, features: dict[str, torch.Tensor]) -> np.ndarray:
         input_ids = features["input_ids"]
         inputs_embeds = self.embed_tokens(input_ids)
         if "pixel_values" in features:
             soft_tokens = self.encode_vision(features["pixel_values"], features["image_position_ids"])
-            image_positions = input_ids == self.image_token_id
-            if int(image_positions.sum()) != soft_tokens.shape[0]:
-                raise ValueError(f"{int(image_positions.sum())} placeholders but {soft_tokens.shape[0]} soft tokens")
-            inputs_embeds[image_positions] = soft_tokens
+            self._splice(inputs_embeds, input_ids, "image", soft_tokens)
+        if "pixel_values_videos" in features:
+            soft_tokens = self.encode_vision(features["pixel_values_videos"], features["video_position_ids"])
+            self._splice(inputs_embeds, input_ids, "video", soft_tokens)
+        if "input_features" in features:
+            audio, mask = pad_audio_features(features["input_features"], features["input_features_mask"])
+            soft_tokens = self.encode_audio(audio, mask)
+            self._splice(inputs_embeds, input_ids, "audio", soft_tokens)
         return self.encode_text(inputs_embeds, features["attention_mask"])
+
+    def _splice(self, inputs_embeds, input_ids, modality: str, soft_tokens) -> None:
+        positions = input_ids == self.token_ids[modality]
+        if int(positions.sum()) != soft_tokens.shape[0]:
+            raise ValueError(f"{int(positions.sum())} {modality} placeholders but {soft_tokens.shape[0]} soft tokens")
+        inputs_embeds[positions] = soft_tokens
+
+
+def pad_audio_features(features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero-pads features [1,F,128] and mask [1,F] to AUDIO_FRAMES; padded frames are masked out."""
+    missing = AUDIO_FRAMES - features.shape[1]
+    if missing < 0:
+        raise ValueError(f"{features.shape[1]} mel frames exceed the {AUDIO_FRAMES}-frame (30 s) audio window")
+    features = torch.nn.functional.pad(features, (0, 0, 0, missing))
+    mask = torch.nn.functional.pad(mask.to(torch.long), (0, missing))
+    return features, mask
 
 
 def make_pooler_exportable(pooling_kernel_size: int) -> None:
@@ -156,39 +206,69 @@ def budget_reference_cases(model: SentenceTransformer, image_path: Path) -> list
     return cases
 
 
+def media_reference_cases(model: SentenceTransformer, audio_paths: list[Path], video_path: Path | None) -> list[dict]:
+    """Audio and video cases embedded by the official sentence-transformers pipeline."""
+    cases = []
+    for path in audio_paths:
+        item = {"audio": {"array": decode_audio(path), "sampling_rate": 16000}}
+        cases.append({"features": model.preprocess([item]), "expected": model.encode(item, normalize_embeddings=True)})
+    if video_path is not None:
+        item = {"video": decode_video_frames(video_path, seconds_per_frame=8, width=480, height=320)}
+        cases.append({"features": model.preprocess([item]), "expected": model.encode(item, normalize_embeddings=True)})
+    return cases
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--audio", type=Path, nargs="+", required=True,
+                        help="clips of different lengths, to prove the audio graph's length is dynamic")
+    parser.add_argument("--video", type=Path, required=True)
     return parser.parse_args()
 
 
 def load_model(model_path: Path) -> SentenceTransformer:
-    model = SentenceTransformer(
-        str(model_path),
-        device="cpu",
-        model_kwargs={"torch_dtype": torch.float32, "attn_implementation": "eager"},
-    )
+    """The model as sentence-transformers users get it, including its default (SDPA) attention.
+
+    Not eager attention: in transformers 5.19 the eager path of the audio encoder's chunked attention
+    is wrong. A voice memo matched its own transcript at 0.69 with eager (unrelated text: 0.63) and
+    0.87 with SDPA (unrelated: 0.57). Text and vision agree under both. Because these references
+    come from the same model object as the export, they must use the default implementation, or a
+    shared bug passes verification unseen (as eager audio did once).
+    """
+    model = SentenceTransformer(str(model_path), device="cpu", model_kwargs={"torch_dtype": torch.float32})
     model.eval()
     return model
 
 
-def build_modules(model: SentenceTransformer) -> tuple[TokenEmbedder, VisionEncoder, TextEncoder]:
+Modules = tuple[TokenEmbedder, VisionEncoder, AudioEncoder, TextEncoder]
+
+
+def build_modules(model: SentenceTransformer) -> Modules:
     backbone = model[0].model
     config = backbone.config
     multimodal_token_ids = [config.image_token_id, config.video_token_id, config.audio_token_id]
     return (
         TokenEmbedder(backbone.language_model, multimodal_token_ids, config.text_config.pad_token_id).eval(),
         VisionEncoder(backbone.vision_tower, backbone.embed_vision).eval(),
+        AudioEncoder(backbone.audio_tower, backbone.embed_audio).eval(),
         TextEncoder(backbone.language_model).eval(),
     )
 
 
+def placeholder_token_ids(model: SentenceTransformer) -> dict[str, int]:
+    config = model[0].model.config
+    return {"image": config.image_token_id, "video": config.video_token_id, "audio": config.audio_token_id}
+
 def preprocess_reference_inputs(model: SentenceTransformer, references: list[dict], image_path: Path) -> list[dict]:
+    """Text and image references; audio and video come from media_reference_cases."""
     cases = []
     for reference in references:
+        if reference["kind"] not in ("text", "image"):
+            continue
         model_input = reference["input"] if reference["kind"] == "text" else {"image": str(image_path)}
         if reference["kind"] == "image" and reference["input"] != image_path.name:
             raise ValueError(f"reference image {reference['input']} does not match --image {image_path.name}")
@@ -208,8 +288,8 @@ def verify(pipeline: Pipeline, cases: list[dict], label: str) -> None:
         raise SystemExit(f"{label} diverges from the reference embeddings")
 
 
-def export_graph(module: nn.Module, example_inputs: dict[str, torch.Tensor], dynamic_shapes: dict,
-                 output_names: list[str], path: Path) -> None:
+def export_graph(module: nn.Module, example_inputs: dict[str, torch.Tensor], dynamic_shapes: dict | None,
+                 output_names: list[str], path: Path, optimize: bool = True) -> None:
     """Exports with the dynamo exporter and weights as external data.
 
     The legacy TorchScript exporter produced ~7k nodes of shape arithmetic for the text encoder,
@@ -226,7 +306,7 @@ def export_graph(module: nn.Module, example_inputs: dict[str, torch.Tensor], dyn
         opset_version=ONNX_OPSET,
         external_data=True,
         dynamo=True,
-        optimize=True,
+        optimize=optimize,
     )
     disable_reshape_allowzero(path)
     print(f"exported {path.name}")
@@ -263,8 +343,8 @@ def repeat_batch(tensor: torch.Tensor) -> torch.Tensor:
     return torch.cat([tensor, tensor], dim=0)
 
 
-def export_all(modules: tuple[TokenEmbedder, VisionEncoder, TextEncoder], image_features: dict, out_dir: Path) -> None:
-    token_embedder, vision_encoder, text_encoder = modules
+def export_all(modules: Modules, image_features: dict, audio_features: dict, out_dir: Path) -> None:
+    token_embedder, vision_encoder, audio_encoder, text_encoder = modules
     out_dir.mkdir(parents=True, exist_ok=True)
     batch = torch.export.Dim("batch", min=1, max=1024)
     sequence = torch.export.Dim("sequence", min=2, max=8192)
@@ -280,37 +360,43 @@ def export_all(modules: tuple[TokenEmbedder, VisionEncoder, TextEncoder], image_
                       "position_ids": repeat_batch(image_features["image_position_ids"])},
                      {"pixel_values": {0: images, 1: patches}, "position_ids": {0: images, 1: patches}},
                      ["soft_tokens"], out_dir / "vision_encoder.onnx")
+        padded_audio, padded_mask = pad_audio_features(audio_features["input_features"],
+                                                       audio_features["input_features_mask"])
+        # The onnxscript optimizer produced an invalid audio graph (a node read a value no node
+        # produced: 'mul_10_min_1'); the unoptimized graph is valid, and ONNX Runtime optimizes at load.
+        export_graph(audio_encoder, {"input_features": padded_audio, "input_features_mask": padded_mask},
+                     None, ["soft_tokens"], out_dir / "audio_encoder.onnx", optimize=False)
         export_graph(text_encoder,
                      {"inputs_embeds": token_embedder(input_ids),
                       "attention_mask": repeat_batch(image_features["attention_mask"])},
                      {"inputs_embeds": {0: batch, 1: sequence}, "attention_mask": {0: batch, 1: sequence}},
                      ["embedding"], out_dir / "text_encoder.onnx")
 
-
-def torch_pipeline(modules: tuple[TokenEmbedder, VisionEncoder, TextEncoder], image_token_id: int) -> Pipeline:
-    token_embedder, vision_encoder, text_encoder = modules
+def torch_pipeline(modules: Modules, token_ids: dict[str, int]) -> Pipeline:
+    token_embedder, vision_encoder, audio_encoder, text_encoder = modules
 
     def no_grad(function):
         return lambda *arguments: torch.no_grad()(function)(*arguments)
 
-    return Pipeline(no_grad(token_embedder), no_grad(vision_encoder),
-                    lambda embeds, mask: no_grad(text_encoder)(embeds, mask).numpy(), image_token_id)
+    return Pipeline(no_grad(token_embedder), no_grad(vision_encoder), no_grad(audio_encoder),
+                    lambda embeds, mask: no_grad(text_encoder)(embeds, mask).numpy(), token_ids)
 
-
-def onnx_pipeline(out_dir: Path, image_token_id: int) -> Pipeline:
+def onnx_pipeline(out_dir: Path, token_ids: dict[str, int]) -> Pipeline:
     def session(name: str) -> onnxruntime.InferenceSession:
         return onnxruntime.InferenceSession(str(out_dir / name), providers=["CPUExecutionProvider"])
 
-    token_embedder, vision_encoder, text_encoder = (
-        session("token_embedder.onnx"), session("vision_encoder.onnx"), session("text_encoder.onnx"))
+    token_embedder, vision_encoder, audio_encoder, text_encoder = (
+        session("token_embedder.onnx"), session("vision_encoder.onnx"), session("audio_encoder.onnx"),
+        session("text_encoder.onnx"))
     return Pipeline(
         lambda ids: torch.from_numpy(token_embedder.run(None, {"input_ids": ids.numpy()})[0]),
         lambda pixels, positions: torch.from_numpy(vision_encoder.run(
             None, {"pixel_values": pixels.numpy(), "position_ids": positions.numpy()})[0]),
+        lambda features, mask: torch.from_numpy(audio_encoder.run(
+            None, {"input_features": features.numpy(), "input_features_mask": mask.numpy()})[0]),
         lambda embeds, mask: text_encoder.run(None, {"inputs_embeds": embeds.numpy(), "attention_mask": mask.numpy()})[0],
-        image_token_id,
+        token_ids,
     )
-
 
 def verify_generalization(model: SentenceTransformer, pipeline: Pipeline) -> None:
     """Check shapes the export never traced: another image aspect ratio and a padded multi-text batch."""
@@ -337,23 +423,28 @@ def main() -> None:
     sys.stderr.reconfigure(encoding="utf-8")
     arguments = parse_arguments()
     model = load_model(arguments.model)
-    image_token_id = model[0].model.config.image_token_id
+    token_ids = placeholder_token_ids(model)
     references = json.loads(arguments.reference.read_text(encoding="utf-8"))
     cases = preprocess_reference_inputs(model, references, arguments.image)
     # References first, with the official pooler; the patch below must reproduce them exactly.
     budget_cases = budget_reference_cases(model, arguments.image)
+    media_cases = media_reference_cases(model, arguments.audio, arguments.video)
     make_pooler_exportable(model[0].model.config.vision_config.pooling_kernel_size)
     modules = build_modules(model)
 
-    verify(torch_pipeline(modules, image_token_id), cases, "torch decomposition")
-    verify(torch_pipeline(modules, image_token_id), budget_cases, "torch decomposition, other token budgets")
+    decomposition = torch_pipeline(modules, token_ids)
+    verify(decomposition, cases, "torch decomposition")
+    verify(decomposition, budget_cases, "torch decomposition, other token budgets")
+    verify(decomposition, media_cases, "torch decomposition, audio and video")
     image_case = next(case for case in cases if "pixel_values" in case["features"])
-    export_all(modules, image_case["features"], arguments.out)
+    audio_case = next(case for case in media_cases if "input_features" in case["features"])
+    export_all(modules, image_case["features"], audio_case["features"], arguments.out)
     for file_name in RUNTIME_FILES:
         shutil.copy2(arguments.model / file_name, arguments.out / file_name)
-    exported = onnx_pipeline(arguments.out, image_token_id)
+    exported = onnx_pipeline(arguments.out, token_ids)
     verify(exported, cases, "onnx runtime")
     verify(exported, budget_cases, "onnx runtime, other token budgets")
+    verify(exported, media_cases, "onnx runtime, audio and video")
     verify_generalization(model, exported)
 
 

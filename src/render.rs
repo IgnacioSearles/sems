@@ -68,7 +68,8 @@ pub fn render(results: &[SearchResult], format: OutputFormat, style: Style, work
 }
 
 /// Each text result is its whole chunk (one function or section, at most a few dozen lines), so
-/// the lines that matched are shown in full; image results show the file and its dimensions.
+/// the lines that matched are shown in full; image results show the file and its dimensions, and
+/// recordings the stretch of time that matched.
 fn render_text(results: &[SearchResult], style: Style, working_directory: &Path) -> String {
     let mut output = String::new();
     for (index, result) in results.iter().enumerate() {
@@ -98,9 +99,28 @@ fn render_text(results: &[SearchResult], style: Style, working_directory: &Path)
                     }
                 }
             }
+            ResultContent::Audio { start_seconds, end_seconds } => {
+                let span = style.paint("32", &time_range(*start_seconds, *end_seconds));
+                writeln!(output, "{path}  {span}  {similarity}  {}", style.paint("36", "[audio]")).unwrap();
+            }
+            ResultContent::Video { start_seconds, end_seconds } => {
+                let span = style.paint("32", &time_range(*start_seconds, *end_seconds));
+                writeln!(output, "{path}  {span}  {similarity}  {}", style.paint("36", "[video]")).unwrap();
+            }
         }
     }
     output
+}
+
+/// `0:08-0:17`, or `1:02:03-1:02:30` past the first hour, as video players show time.
+fn time_range(start_seconds: f64, end_seconds: f64) -> String {
+    format!("{}-{}", timestamp(start_seconds), timestamp(end_seconds))
+}
+
+fn timestamp(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
+    if hours > 0 { format!("{hours}:{minutes:02}:{seconds:02}") } else { format!("{minutes}:{seconds:02}") }
 }
 
 fn write_numbered_lines(output: &mut String, style: Style, start_line: usize, end_line: usize, text: &str) {
@@ -217,6 +237,28 @@ mod tests {
             serde_json::from_str(&render(&results, OutputFormat::Json, Style::PLAIN, &working_directory())).unwrap();
         assert_eq!((json[0]["kind"].as_str(), json[0]["page"].as_u64()), (Some("pdf"), Some(3)));
         assert!(json[0].get("start_line").is_none(), "lines within a PDF page are internal");
+    }
+
+    #[test]
+    fn recording_results_show_the_matching_time() {
+        let results = [
+            SearchResult {
+                path: PathBuf::from("clip.mp4"),
+                similarity: 0.71,
+                content: ResultContent::Video { start_seconds: 8.0, end_seconds: 17.4 },
+            },
+            SearchResult {
+                path: PathBuf::from("podcast.mp3"),
+                similarity: 0.64,
+                content: ResultContent::Audio { start_seconds: 3725.0, end_seconds: 3755.0 },
+            },
+        ];
+        let output = render(&results, OutputFormat::Text, Style::PLAIN, &working_directory());
+        assert_eq!(output, "clip.mp4  0:08-0:17  0.71  [video]\n\npodcast.mp3  1:02:05-1:02:35  0.64  [audio]\n");
+        let json: serde_json::Value =
+            serde_json::from_str(&render(&results, OutputFormat::Json, Style::PLAIN, &working_directory())).unwrap();
+        assert_eq!((json[0]["kind"].as_str(), json[0]["start_seconds"].as_f64()), (Some("video"), Some(8.0)));
+        assert_eq!(json[1]["end_seconds"].as_f64(), Some(3755.0));
     }
 
     #[test]

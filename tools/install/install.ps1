@@ -8,7 +8,7 @@ the ONNX Runtime it needs are in %LOCALAPPDATA%\sems, and adds the bin directory
 Open a new terminal afterwards to pick up the PATH change. Running it again updates the install.
 
 .PARAMETER Cuda
-Also install the optional CUDA runtime pack (~900 MB, NVIDIA driver 580+) for fast indexing.
+Also install the optional CUDA runtime pack (~1.2 GB, NVIDIA driver 580+) for fast indexing.
 
 .PARAMETER SkipBuild
 Install the already built target\release\sems.exe instead of building it.
@@ -36,6 +36,8 @@ $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $DataDirectory = Join-Path $env:LOCALAPPDATA 'sems'
 $BinDirectory = Join-Path $DataDirectory 'bin'
 $InstalledExecutable = Join-Path $BinDirectory 'sems.exe'
+# Every graph sems loads; an install from before audio support lacks audio_encoder.onnx.
+$ModelGraphs = @('token_embedder.onnx', 'text_encoder.onnx', 'vision_encoder.onnx', 'audio_encoder.onnx')
 
 # --- User PATH -------------------------------------------------------------------------------------
 # Edited in the registry as REG_EXPAND_SZ, read without expansion, so entries such as %USERPROFILE%\bin
@@ -136,19 +138,35 @@ function Install-Runtime([string]$Flavor) {
     if ($LASTEXITCODE -ne 0) { throw "Installing the $Flavor runtime failed with exit code $LASTEXITCODE" }
 }
 
+function Test-CompleteModel([string]$Directory) {
+    foreach ($graph in $ModelGraphs) {
+        if (-not (Test-Path (Join-Path $Directory $graph))) { return $false }
+    }
+    return $true
+}
+
 function Install-Model {
     $installedModel = Join-Path $DataDirectory 'model'
-    if (Test-Path (Join-Path $installedModel 'text_encoder.onnx')) {
+    if (Test-CompleteModel $installedModel) {
         Write-Host 'Model already installed'
         return
     }
     $exportedModel = Join-Path $RepositoryRoot 'models\onnx'
-    if (-not (Test-Path (Join-Path $exportedModel 'text_encoder.onnx'))) {
-        throw "No exported model found. Export it first (see README, Setup step 1), then run this script again."
+    if (-not (Test-CompleteModel $exportedModel)) {
+        throw "No complete exported model in $exportedModel. Export it first (see README, Setup step 1), then run this script again."
     }
-    Write-Host 'Copying the model (~1.7 GB)...'
+    Write-Host 'Copying the model (~2.9 GB)...'
     New-Item -ItemType Directory -Force -Path $installedModel | Out-Null
     Copy-Item -Path (Join-Path $exportedModel '*') -Destination $installedModel -Force
+}
+
+# sems runs the user's ffmpeg to decode audio and video rather than bundling one.
+function Show-FfmpegStatus {
+    if ($env:SEMS_FFMPEG -or (Get-Command 'ffmpeg' -ErrorAction SilentlyContinue)) {
+        Write-Host 'ffmpeg found: audio and video will be indexed'
+    } else {
+        Write-Host 'ffmpeg not found: audio and video are skipped until it is installed (winget install Gyan.FFmpeg)'
+    }
 }
 
 # --- Main ------------------------------------------------------------------------------------------
@@ -167,6 +185,7 @@ Install-Executable
 Install-Model
 Install-Runtime 'directml'
 if ($Cuda) { Install-Runtime 'cuda' }
+Show-FfmpegStatus
 
 if (Add-ToUserPath $BinDirectory) {
     Write-Host "Added $BinDirectory to your PATH. Open a new terminal to use 'sems'."

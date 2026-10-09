@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use sems::chunking::ChunkingConfig;
+use sems::av::Ffmpeg;
 use sems::device::{DeviceChoice, RuntimeLayout, cuda_driver_supports, plan_runtime};
 use sems::discovery::{DiscoveryOptions, FileKind};
 use sems::embedding::{EmbeddingModel, ExecutionDevice, OnnxRuntime};
@@ -103,6 +103,8 @@ enum KindFilter {
     Text,
     Image,
     Pdf,
+    Audio,
+    Video,
 }
 
 impl From<KindFilter> for FileKind {
@@ -111,6 +113,8 @@ impl From<KindFilter> for FileKind {
             KindFilter::Text => FileKind::Text,
             KindFilter::Image => FileKind::Image,
             KindFilter::Pdf => FileKind::Pdf,
+            KindFilter::Audio => FileKind::Audio,
+            KindFilter::Video => FileKind::Video,
         }
     }
 }
@@ -135,6 +139,12 @@ struct IndexArguments {
     /// Do not index images (each takes ~5 s on a CPU, well under 1 s with --device cuda)
     #[arg(long)]
     skip_images: bool,
+    /// Do not index audio files (each 25 s of audio takes ~3 s on a CPU, ~0.5 s with CUDA)
+    #[arg(long)]
+    skip_audio: bool,
+    /// Do not index videos (each 9 s of video takes ~8 s on a CPU, under 1 s with CUDA)
+    #[arg(long)]
+    skip_video: bool,
 }
 
 /// Where sems keeps its index and finds its model; flags override environment variables.
@@ -209,11 +219,7 @@ fn main() -> ExitCode {
 
 fn index_identity() -> IndexIdentity {
     let config = GemmaEncoderConfig::default();
-    IndexIdentity {
-        encoder: config.identity(),
-        dimensions: config.dimensions,
-        chunker_version: ChunkingConfig::VERSION,
-    }
+    IndexIdentity::current(config.identity(), config.dimensions)
 }
 
 /// Loads the model on the first device in the plan that works, and reports which one it was.
@@ -296,7 +302,10 @@ fn run_index(arguments: &IndexArguments, locations: &Locations) -> Result<()> {
             max_text_size: arguments.max_file_size,
             max_media_size: arguments.max_media_size,
             include_images: !arguments.skip_images,
+            include_audio: !arguments.skip_audio,
+            include_video: !arguments.skip_video,
         },
+        ffmpeg: Ffmpeg::locate(),
         ..IndexOptions::default()
     };
     let mut progress = TerminalProgress::new();
@@ -313,10 +322,11 @@ fn run_status(path: Option<&Path>, locations: &Locations) -> Result<()> {
     let statistics = store.statistics(&PathScope::new(&root))?;
     let working_directory = std::env::current_dir()?;
     write_stdout(&format!(
-        "{}: {} files ({} images), {} chunks indexed\nindex: {}\n",
+        "{}: {} files ({} images, {} audio and video), {} chunks indexed\nindex: {}\n",
         display_path(&root, &working_directory),
         statistics.files,
         statistics.images,
+        statistics.recordings,
         statistics.chunks,
         index_path.display()
     ))
@@ -330,16 +340,23 @@ fn summary_line(root: &Path, summary: &IndexSummary, dimensions: usize, device: 
         (summary.images_unreadable, "unreadable images"),
         (summary.pdfs_without_text, "PDFs without text (scans need OCR)"),
         (summary.pdfs_unreadable, "unreadable PDFs"),
+        (summary.recordings_without_ffmpeg, "audio/video files (install ffmpeg to index them)"),
+        (summary.recordings_unreadable, "unreadable audio/video files"),
+        (summary.recordings_without_content, "silent audio/video files"),
     ]
     .into_iter()
     .filter(|(count, _)| *count > 0)
     .map(|(count, reason)| format!("{count} {reason}"))
     .collect();
     let skipped = if skipped.is_empty() { String::new() } else { format!(", skipped {}", skipped.join(", ")) };
-    let images =
-        if summary.images_embedded > 0 { format!(" ({} images)", summary.images_embedded) } else { String::new() };
+    let media: Vec<String> = [(summary.images_embedded, "images"), (summary.recordings_embedded, "audio/video")]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, kind)| format!("{count} {kind}"))
+        .collect();
+    let media = if media.is_empty() { String::new() } else { format!(" ({})", media.join(", ")) };
     format!(
-        "indexed {}: {} files ({} unchanged, {} embedded{images} into {} chunks, {} removed{skipped}) in {:.1}s [{}, {dimensions}d]",
+        "indexed {}: {} files ({} unchanged, {} embedded{media} into {} chunks, {} removed{skipped}) in {:.1}s [{}, {dimensions}d]",
         root.display(),
         summary.files_seen,
         summary.files_unchanged,

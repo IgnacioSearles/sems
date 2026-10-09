@@ -2,3 +2,7 @@
 *.pdf binary
 *.png binary
 *.jpg binary
+*.wav binary
+*.mp3 binary
+*.m4a binary
+*.mp4 binary

@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use image::DynamicImage;
-use sems::chunking::ChunkingConfig;
+use sems::av::{Ffmpeg, SAMPLE_RATE};
 use sems::discovery::FileKind;
 use sems::encoder::{Document, Encoder};
 use sems::indexer::{IndexOptions, IndexSummary, SilentProgress, index_directory};
-use sems::search::{ResultContent, SearchOptions, search};
+use sems::search::{ResultContent, SearchOptions, SearchResult, search};
+use sems::segments::{MediaSegmentation, TimeSpan};
 use sems::store::{IndexIdentity, IndexStore, PathScope};
 
 const DIMENSIONS: usize = 64;
@@ -32,6 +33,26 @@ impl BagOfWordsEncoder {
         let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt().max(f32::EPSILON);
         vector.iter().map(|value| value / norm).collect()
     }
+
+    /// The image's dominant channel, so a red picture lands near the query "red".
+    fn dominant_color(image: &DynamicImage) -> &'static str {
+        let rgb = image.to_rgb8();
+        let mut totals = [0u64; 3];
+        for pixel in rgb.pixels() {
+            for (total, value) in totals.iter_mut().zip(pixel.0) {
+                *total += u64::from(value);
+            }
+        }
+        ["red", "green", "blue"][(0..3).max_by_key(|&channel| totals[channel]).unwrap()]
+    }
+
+    /// "bass" or "treble", from the tone's frequency (zero crossings per second, halved). Words
+    /// chosen so they hash to different buckets ("low" and "high" collide).
+    fn pitch(samples: &[f32]) -> &'static str {
+        let crossings = samples.windows(2).filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0)).count();
+        let frequency = crossings as f32 / 2.0 / (samples.len() as f32 / SAMPLE_RATE as f32);
+        if frequency < 1_000.0 { "bass" } else { "treble" }
+    }
 }
 
 impl Encoder for BagOfWordsEncoder {
@@ -52,18 +73,18 @@ impl Encoder for BagOfWordsEncoder {
         Ok(documents.iter().map(|document| Self::vector(document.text)).collect())
     }
 
-    /// Names the image's dominant channel, so a red picture lands near the query "red".
     fn encode_image(&mut self, image: &DynamicImage) -> Result<Vec<f32>> {
         self.images_encoded += 1;
-        let rgb = image.to_rgb8();
-        let mut totals = [0u64; 3];
-        for pixel in rgb.pixels() {
-            for (total, value) in totals.iter_mut().zip(pixel.0) {
-                *total += u64::from(value);
-            }
-        }
-        let dominant = ["red", "green", "blue"][(0..3).max_by_key(|&channel| totals[channel]).unwrap()];
-        Ok(Self::vector(dominant))
+        Ok(Self::vector(Self::dominant_color(image)))
+    }
+
+    fn encode_video(&mut self, frames: &[DynamicImage]) -> Result<Vec<f32>> {
+        let colors: Vec<&str> = frames.iter().map(Self::dominant_color).collect();
+        Ok(Self::vector(&colors.join(" ")))
+    }
+
+    fn encode_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
+        Ok(Self::vector(Self::pitch(samples)))
     }
 }
 
@@ -78,11 +99,7 @@ impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = dunce::canonicalize(directory.path()).unwrap();
-        let identity = IndexIdentity {
-            encoder: "bag-of-words".into(),
-            dimensions: DIMENSIONS,
-            chunker_version: ChunkingConfig::VERSION,
-        };
+        let identity = IndexIdentity::current("bag-of-words".into(), DIMENSIONS);
         let store = IndexStore::open_in_memory(identity).unwrap();
         Self { _directory: directory, root, store, encoder: BagOfWordsEncoder::default() }
     }
@@ -94,8 +111,46 @@ impl Fixture {
     }
 
     fn index(&mut self) -> IndexSummary {
-        let options = IndexOptions::default();
-        index_directory(&mut self.store, &mut self.encoder, &self.root, &options, &mut SilentProgress).unwrap()
+        self.index_with(&IndexOptions::default())
+    }
+
+    fn index_with(&mut self, options: &IndexOptions) -> IndexSummary {
+        index_directory(&mut self.store, &mut self.encoder, &self.root, options, &mut SilentProgress).unwrap()
+    }
+
+    fn search(&mut self, query: &str, kind: Option<FileKind>) -> Vec<SearchResult> {
+        let scope = PathScope::new(&self.root);
+        let options = SearchOptions { kind, relevance_cutoff: false, ..SearchOptions::default() };
+        search(&self.store, &mut self.encoder, &scope, query, options).unwrap()
+    }
+
+    /// 16 kHz mono 16-bit PCM; each part is a sine tone of `frequency` Hz (0 for silence).
+    fn write_wav(&self, relative: &str, parts: &[(f32, f32)]) {
+        let samples: Vec<i16> = parts
+            .iter()
+            .flat_map(|&(frequency, seconds)| {
+                (0..(seconds * SAMPLE_RATE as f32) as usize).map(move |index| {
+                    let time = index as f32 / SAMPLE_RATE as f32;
+                    ((time * frequency * std::f32::consts::TAU).sin() * 0.5 * f32::from(i16::MAX)) as i16
+                })
+            })
+            .collect();
+        let data_bytes = (samples.len() * 2) as u32;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes()); // format chunk size
+        wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1_u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE as u32 * 2).to_le_bytes()); // bytes per second
+        wav.extend_from_slice(&2_u16.to_le_bytes()); // bytes per sample frame
+        wav.extend_from_slice(&16_u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        wav.extend(samples.iter().flat_map(|sample| sample.to_le_bytes()));
+        std::fs::write(self.root.join(relative), wav).unwrap();
     }
 
     fn write_image(&self, relative: &str, color: [u8; 3], size: u32) {
@@ -308,4 +363,104 @@ fn skipping_images_leaves_them_out_of_the_index() {
         index_directory(&mut fixture.store, &mut fixture.encoder, &fixture.root, &options, &mut SilentProgress)
             .unwrap();
     assert_eq!((summary.files_seen, summary.images_embedded), (1, 0));
+}
+
+/// Recording tests decode with the real ffmpeg; they are skipped (not failed) without it.
+fn ffmpeg_or_skip() -> Option<Ffmpeg> {
+    let ffmpeg = Ffmpeg::locate();
+    if ffmpeg.is_none() {
+        eprintln!("ffmpeg not found; skipping");
+    }
+    ffmpeg
+}
+
+/// Short segments so small generated recordings still have several.
+fn recording_options(ffmpeg: Ffmpeg) -> IndexOptions {
+    IndexOptions {
+        ffmpeg: Some(ffmpeg),
+        segmentation: MediaSegmentation {
+            audio_window_seconds: 10,
+            audio_hop_seconds: 10,
+            video_seconds_per_frame: 2,
+            video_frames_per_segment: 2,
+            ..MediaSegmentation::default()
+        },
+        ..IndexOptions::default()
+    }
+}
+
+fn time_span(result: &SearchResult) -> TimeSpan {
+    result.content.time_span().unwrap_or_else(|| panic!("expected a recording, got {:?}", result.content))
+}
+
+#[test]
+fn recordings_wait_for_ffmpeg_instead_of_being_skipped_for_good() {
+    let Some(ffmpeg) = ffmpeg_or_skip() else { return };
+    let mut fixture = Fixture::new();
+    fixture.write_wav("memo.wav", &[(200.0, 3.0)]);
+
+    let without = fixture.index();
+    assert_eq!((without.recordings_without_ffmpeg, without.files_embedded), (1, 0));
+    let with = fixture.index_with(&recording_options(ffmpeg));
+    assert_eq!(with.recordings_embedded, 1, "not tracked as skipped, so it is indexed once ffmpeg is there");
+}
+
+#[test]
+fn audio_is_indexed_and_found_by_time() {
+    let Some(ffmpeg) = ffmpeg_or_skip() else { return };
+    let mut fixture = Fixture::new();
+    fixture.write_wav("memo.wav", &[(200.0, 20.0), (3_000.0, 20.0)]);
+    let summary = fixture.index_with(&recording_options(ffmpeg));
+    assert_eq!((summary.recordings_embedded, summary.chunks_embedded), (1, 4));
+
+    let results = fixture.search("treble", Some(FileKind::Audio));
+    assert_eq!(time_span(&results[0]), TimeSpan::from_seconds(20.0, 30.0));
+    assert!(matches!(results[0].content, ResultContent::Audio { .. }));
+}
+
+#[test]
+fn silence_is_not_embedded() {
+    let Some(ffmpeg) = ffmpeg_or_skip() else { return };
+    let mut fixture = Fixture::new();
+    fixture.write_wav("quiet.wav", &[(0.0, 15.0)]);
+    fixture.write_wav("pause.wav", &[(200.0, 10.0), (0.0, 10.0), (3_000.0, 10.0)]);
+    let summary = fixture.index_with(&recording_options(ffmpeg));
+    assert_eq!(summary.recordings_without_content, 1);
+    assert_eq!(summary.chunks_embedded, 2, "the silent middle of pause.wav is skipped");
+}
+
+#[test]
+fn unreadable_recordings_are_skipped_once() {
+    let Some(ffmpeg) = ffmpeg_or_skip() else { return };
+    let mut fixture = Fixture::new();
+    fixture.write("broken.mp4", "not a video");
+    let options = recording_options(ffmpeg);
+    assert_eq!(fixture.index_with(&options).recordings_unreadable, 1);
+    assert_eq!(fixture.index_with(&options).files_unchanged, 1);
+}
+
+#[test]
+fn videos_are_indexed_by_frames_and_soundtrack() {
+    let Some(ffmpeg) = ffmpeg_or_skip() else { return };
+    let mut fixture = Fixture::new();
+    // 4 s of red then 4 s of blue, over a high tone.
+    let status = std::process::Command::new(ffmpeg.executable())
+        .args(["-v", "error", "-f", "lavfi", "-i", "color=c=red:s=64x48:r=10:d=4"])
+        .args(["-f", "lavfi", "-i", "color=c=blue:s=64x48:r=10:d=4"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=3000:duration=8"])
+        .args(["-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[video]", "-map", "[video]", "-map", "2:a"])
+        .args(["-c:v", "mpeg4", "-c:a", "aac"])
+        .arg(fixture.root.join("clip.mp4"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "ffmpeg could not create the test video");
+
+    let summary = fixture.index_with(&recording_options(ffmpeg));
+    assert_eq!((summary.recordings_embedded, summary.chunks_embedded), (1, 3), "two frame segments, one soundtrack");
+    let blue = fixture.search("blue", Some(FileKind::Video));
+    assert_eq!(time_span(&blue[0]), TimeSpan::from_seconds(4.0, 8.0));
+    let tone = time_span(&fixture.search("treble", None)[0]);
+    // AAC adds a few milliseconds of encoder padding to the decoded soundtrack.
+    assert_eq!(tone.start_milliseconds, 0);
+    assert!((7_900..8_100).contains(&tone.end_milliseconds), "soundtrack span {tone:?}");
 }

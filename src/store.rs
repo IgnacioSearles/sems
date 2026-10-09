@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::chunking::Chunk;
+use crate::chunking::{Chunk, ChunkingConfig};
 use crate::discovery::FileKind;
+use crate::segments::{MediaSegmentation, TimeSpan};
 
 /// Bumped whenever the schema changes incompatibly.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS metadata (
@@ -27,8 +28,10 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS chunks (
         id          INTEGER PRIMARY KEY,
         file_id     INTEGER NOT NULL REFERENCES files(id),
-        kind        TEXT NOT NULL CHECK (kind IN ('text', 'image', 'pdf')),
+        kind        TEXT NOT NULL CHECK (kind IN ('text', 'image', 'pdf', 'audio', 'video')),
         page        INTEGER,
+        start_milliseconds  INTEGER,
+        end_milliseconds    INTEGER,
         start_line  INTEGER NOT NULL,
         end_line    INTEGER NOT NULL,
         text        TEXT NOT NULL,
@@ -56,6 +59,19 @@ pub struct IndexIdentity {
     pub encoder: String,
     pub dimensions: usize,
     pub chunker_version: u32,
+    pub segmentation_version: u32,
+}
+
+impl IndexIdentity {
+    /// The identity of an index built by this version of sems with the given encoder.
+    pub fn current(encoder: String, dimensions: usize) -> Self {
+        Self {
+            encoder,
+            dimensions,
+            chunker_version: ChunkingConfig::VERSION,
+            segmentation_version: MediaSegmentation::VERSION,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,12 +82,14 @@ pub struct FileRecord {
 }
 
 /// A stored chunk. Image chunks cover the whole file: no lines, no text. PDF chunks carry the
-/// page they come from, and lines counted within that page's extracted text.
+/// page they come from, and lines counted within that page's extracted text. Audio and video
+/// chunks carry the stretch of time they cover, and no lines or text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkRecord {
     pub path: PathBuf,
     pub kind: FileKind,
     pub page: Option<usize>,
+    pub time_span: Option<TimeSpan>,
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
@@ -84,6 +102,8 @@ pub struct ChunkRecord {
 pub struct ScopeStatistics {
     pub files: usize,
     pub images: usize,
+    /// Audio and video files.
+    pub recordings: usize,
     pub chunks: usize,
 }
 
@@ -189,12 +209,13 @@ impl IndexStore {
         Ok(store)
     }
 
-    fn expected_metadata(&self) -> [(&'static str, String); 4] {
+    fn expected_metadata(&self) -> [(&'static str, String); 5] {
         [
             ("schema_version", SCHEMA_VERSION.to_string()),
             ("encoder", self.identity.encoder.clone()),
             ("dimensions", self.identity.dimensions.to_string()),
             ("chunker_version", self.identity.chunker_version.to_string()),
+            ("segmentation_version", self.identity.segmentation_version.to_string()),
         ]
     }
 
@@ -261,6 +282,7 @@ impl IndexStore {
             .map(|(chunk, embedding)| ChunkRow {
                 kind: FileKind::Text,
                 page: None,
+                time_span: None,
                 start_line: chunk.start_line,
                 end_line: chunk.end_line,
                 text: &chunk.text,
@@ -272,8 +294,22 @@ impl IndexStore {
 
     /// Stores an image as a single chunk holding its embedding.
     pub fn replace_image_file(&mut self, path: &Path, record: &FileRecord, embedding: &[f32]) -> Result<()> {
-        let row = ChunkRow { kind: FileKind::Image, page: None, start_line: 0, end_line: 0, text: "", embedding };
+        let row = ChunkRow::without_text(FileKind::Image, None, embedding);
         self.write_file(path, record, &[row])
+    }
+
+    /// Replaces an audio or video file's chunks, one per embedded stretch of time.
+    pub fn replace_recording_file(
+        &mut self,
+        path: &Path,
+        record: &FileRecord,
+        kind: FileKind,
+        segments: &[(TimeSpan, Vec<f32>)],
+    ) -> Result<()> {
+        ensure!(kind.is_recording(), "{kind:?} is not a recording kind");
+        let rows: Vec<ChunkRow<'_>> =
+            segments.iter().map(|(span, embedding)| ChunkRow::without_text(kind, Some(*span), embedding)).collect();
+        self.write_file(path, record, &rows)
     }
 
     /// Replaces a PDF's chunks; each carries its 1-based page number.
@@ -288,6 +324,7 @@ impl IndexStore {
             .map(|(page, chunk, embedding)| ChunkRow {
                 kind: FileKind::Pdf,
                 page: Some(*page),
+                time_span: None,
                 start_line: chunk.start_line,
                 end_line: chunk.end_line,
                 text: &chunk.text,
@@ -324,14 +361,17 @@ impl IndexStore {
         )?;
         {
             let mut insert = transaction.prepare(
-                "INSERT INTO chunks(file_id, kind, page, start_line, end_line, text, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO chunks(file_id, kind, page, start_milliseconds, end_milliseconds, start_line,
+                                    end_line, text, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for row in rows {
                 insert.execute(params![
                     file_id,
                     kind_key(row.kind),
                     row.page.map(|page| page as i64),
+                    row.time_span.map(|span| span.start_milliseconds as i64),
+                    row.time_span.map(|span| span.end_milliseconds as i64),
                     row.start_line as i64,
                     row.end_line as i64,
                     row.text,
@@ -421,49 +461,98 @@ impl IndexStore {
     }
 
     pub fn chunk(&self, chunk_id: i64) -> Result<ChunkRecord> {
-        type Row = (String, String, Option<i64>, i64, i64, String, Vec<u8>);
-        let (path, kind, page, start_line, end_line, text, embedding): Row = self
+        let stored = self
             .connection
             .query_row(
-                "SELECT f.path, c.kind, c.page, c.start_line, c.end_line, c.text, c.embedding
+                "SELECT f.path, c.kind, c.page, c.start_milliseconds, c.end_milliseconds, c.start_line,
+                        c.end_line, c.text, c.embedding
                  FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?1",
                 [chunk_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+                StoredChunk::from_row,
             )
             .with_context(|| format!("chunk {chunk_id} not found"))?;
-        Ok(ChunkRecord {
-            path: PathBuf::from(path),
-            kind: parse_kind(&kind)?,
-            page: page.map(|page| page as usize),
-            start_line: start_line as usize,
-            end_line: end_line as usize,
-            text,
-            embedding: decode_vector(&embedding)?,
-        })
+        stored.into_record()
     }
 
     pub fn statistics(&self, scope: &PathScope) -> Result<ScopeStatistics> {
         let sql = format!(
             "SELECT COUNT(DISTINCT c.file_id),
                     COUNT(DISTINCT CASE WHEN c.kind = 'image' THEN c.file_id END),
+                    COUNT(DISTINCT CASE WHEN c.kind IN ('audio', 'video') THEN c.file_id END),
                     COUNT(c.id)
              FROM chunks c JOIN files f ON f.id = c.file_id WHERE {}",
             PathScope::CONDITION
         );
-        let (files, images, chunks): (i64, i64, i64) =
-            self.connection
-                .query_row(&sql, scope.parameters().as_slice(), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        Ok(ScopeStatistics { files: files as usize, images: images as usize, chunks: chunks as usize })
+        let counts: [i64; 4] = self.connection.query_row(&sql, scope.parameters().as_slice(), |row| {
+            Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?])
+        })?;
+        let [files, images, recordings, chunks] = counts.map(|count| count as usize);
+        Ok(ScopeStatistics { files, images, recordings, chunks })
     }
 }
 
 struct ChunkRow<'a> {
     kind: FileKind,
     page: Option<usize>,
+    time_span: Option<TimeSpan>,
     start_line: usize,
     end_line: usize,
     text: &'a str,
     embedding: &'a [f32],
+}
+
+impl<'a> ChunkRow<'a> {
+    /// A chunk embedded from pixels or sound: no lines, and no text for keyword search.
+    fn without_text(kind: FileKind, time_span: Option<TimeSpan>, embedding: &'a [f32]) -> Self {
+        Self { kind, page: None, time_span, start_line: 0, end_line: 0, text: "", embedding }
+    }
+}
+
+/// A chunk row as SQLite returns it, before kinds and vectors are decoded (which can fail with
+/// errors SQLite's row mapping cannot carry).
+struct StoredChunk {
+    path: String,
+    kind: String,
+    page: Option<i64>,
+    start_milliseconds: Option<i64>,
+    end_milliseconds: Option<i64>,
+    start_line: i64,
+    end_line: i64,
+    text: String,
+    embedding: Vec<u8>,
+}
+
+impl StoredChunk {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            path: row.get(0)?,
+            kind: row.get(1)?,
+            page: row.get(2)?,
+            start_milliseconds: row.get(3)?,
+            end_milliseconds: row.get(4)?,
+            start_line: row.get(5)?,
+            end_line: row.get(6)?,
+            text: row.get(7)?,
+            embedding: row.get(8)?,
+        })
+    }
+
+    fn into_record(self) -> Result<ChunkRecord> {
+        let time_span = self
+            .start_milliseconds
+            .zip(self.end_milliseconds)
+            .map(|(start, end)| TimeSpan { start_milliseconds: start as u64, end_milliseconds: end as u64 });
+        Ok(ChunkRecord {
+            path: PathBuf::from(self.path),
+            kind: parse_kind(&self.kind)?,
+            page: self.page.map(|page| page as usize),
+            time_span,
+            start_line: self.start_line as usize,
+            end_line: self.end_line as usize,
+            text: self.text,
+            embedding: decode_vector(&self.embedding)?,
+        })
+    }
 }
 
 fn kind_key(kind: FileKind) -> &'static str {
@@ -471,6 +560,8 @@ fn kind_key(kind: FileKind) -> &'static str {
         FileKind::Text => "text",
         FileKind::Image => "image",
         FileKind::Pdf => "pdf",
+        FileKind::Audio => "audio",
+        FileKind::Video => "video",
     }
 }
 
@@ -479,6 +570,8 @@ fn parse_kind(key: &str) -> Result<FileKind> {
         "text" => Ok(FileKind::Text),
         "image" => Ok(FileKind::Image),
         "pdf" => Ok(FileKind::Pdf),
+        "audio" => Ok(FileKind::Audio),
+        "video" => Ok(FileKind::Video),
         other => bail!("unknown chunk kind {other:?} in index"),
     }
 }
@@ -556,7 +649,7 @@ mod tests {
     use super::*;
 
     fn identity() -> IndexIdentity {
-        IndexIdentity { encoder: "test-encoder".into(), dimensions: 2, chunker_version: 1 }
+        IndexIdentity { encoder: "test-encoder".into(), dimensions: 2, chunker_version: 1, segmentation_version: 1 }
     }
 
     fn record(seed: u8) -> FileRecord {
@@ -579,7 +672,8 @@ mod tests {
         store.replace_text_file(&path, &record(2), &[chunk("new_term", [0.0, 1.0])]).unwrap();
 
         let scope = PathScope::new(&root());
-        assert_eq!(store.statistics(&scope).unwrap(), ScopeStatistics { files: 1, images: 0, chunks: 1 });
+        let expected = ScopeStatistics { files: 1, images: 0, recordings: 0, chunks: 1 };
+        assert_eq!(store.statistics(&scope).unwrap(), expected);
         assert!(store.keyword_chunks(&scope, "\"old_term\"", 10).unwrap().is_empty());
         assert_eq!(store.keyword_chunks(&scope, "\"new_term\"", 10).unwrap().len(), 1);
         assert_eq!(store.files_in_scope(&scope).unwrap()[&path].content_hash, [2; 32]);
@@ -610,7 +704,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         let image = store.chunk(results[0].0).unwrap();
         assert_eq!((image.kind, image.path), (FileKind::Image, root().join("b.jpg")));
-        assert_eq!(store.statistics(&scope).unwrap(), ScopeStatistics { files: 2, images: 1, chunks: 2 });
+        let expected = ScopeStatistics { files: 2, images: 1, recordings: 0, chunks: 2 };
+        assert_eq!(store.statistics(&scope).unwrap(), expected);
     }
 
     #[test]
@@ -621,6 +716,23 @@ mod tests {
         let results = store.nearest_chunks(&PathScope::new(&root()), &[1.0, 0.0], 10, Some(FileKind::Pdf)).unwrap();
         let stored = store.chunk(results[0].0).unwrap();
         assert_eq!((stored.kind, stored.page), (FileKind::Pdf, Some(3)));
+    }
+
+    #[test]
+    fn recording_chunks_keep_their_time_span() {
+        let mut store = IndexStore::open_in_memory(identity()).unwrap();
+        let path = root().join("clip.mp4");
+        let segments =
+            [(TimeSpan::from_seconds(0.0, 9.0), vec![1.0, 0.0]), (TimeSpan::from_seconds(9.0, 18.0), vec![0.0, 1.0])];
+        store.replace_recording_file(&path, &record(1), FileKind::Video, &segments).unwrap();
+
+        let scope = PathScope::new(&root());
+        let results = store.nearest_chunks(&scope, &[0.0, 1.0], 1, Some(FileKind::Video)).unwrap();
+        let stored = store.chunk(results[0].0).unwrap();
+        assert_eq!((stored.kind, stored.time_span), (FileKind::Video, Some(TimeSpan::from_seconds(9.0, 18.0))));
+        let expected = ScopeStatistics { files: 1, images: 0, recordings: 1, chunks: 2 };
+        assert_eq!(store.statistics(&scope).unwrap(), expected);
+        assert!(store.replace_recording_file(&path, &record(1), FileKind::Image, &segments).is_err());
     }
 
     #[test]
@@ -649,7 +761,8 @@ mod tests {
         store.replace_text_file(&path, &record(1), &[chunk("vanishing", [1.0, 0.0])]).unwrap();
         store.remove_file(&path).unwrap();
         let scope = PathScope::new(&root());
-        assert_eq!(store.statistics(&scope).unwrap(), ScopeStatistics { files: 0, images: 0, chunks: 0 });
+        let expected = ScopeStatistics { files: 0, images: 0, recordings: 0, chunks: 0 };
+        assert_eq!(store.statistics(&scope).unwrap(), expected);
         assert!(store.keyword_chunks(&scope, "\"vanishing\"", 10).unwrap().is_empty());
     }
 

@@ -13,6 +13,12 @@ pub struct ModelConfig {
     pub image_token_id: i64,
     pub boi_token_id: i64,
     pub eoi_token_id: i64,
+    pub video_token_id: i64,
+    pub audio_token_id: i64,
+    pub boa_token_id: i64,
+    /// Named `eoa_token_index` in the shipped config, unlike its siblings.
+    #[serde(rename = "eoa_token_index")]
+    pub eoa_token_id: i64,
     pub text_config: TextConfig,
     pub vision_config: VisionConfig,
 }

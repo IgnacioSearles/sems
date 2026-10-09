@@ -46,10 +46,23 @@ tests\fixtures\eval_corpus\docs\lease_agreement.pdf  page 2  0.73
     An additional pet deposit of 300 EUR applies and is refundable at move-out.
 ```
 
+Audio and video are searched by what is said and what is shown, down to the moment:
+
+```console
+> sems "when is the dentist appointment"
+tests\fixtures\eval_corpus\audio\memo_0003.m4a  0:00-0:30  0.69  [audio]
+
+> sems "how do I repot a plant"
+tests\fixtures\eval_corpus\videos\clip_0001.mp4  0:00-0:12  0.79  [video]
+
+> sems --kind video "a rocket launch"
+tests\fixtures\eval_corpus\videos\clip_0001.mp4  0:09-0:18  0.74  [video]
+```
+
 ## Status
 
-Text, code, images, and PDFs. Scanned PDFs (no text layer, so they need OCR), video, and audio
-come next.
+Text, code, images, PDFs, audio, and video. Scanned PDFs (no text layer, so they need OCR) come
+next. Indexes built before audio and video support need `sems index --rebuild` once.
 
 ## Usage
 
@@ -58,17 +71,20 @@ sems <QUERY> [PATH]           search under PATH (default: current directory)
     -n, --limit <N>           number of results (default 10)
     -l, --files-with-matches  print matching file paths only, best first
         --json                full results as JSON (with a "kind" per result), for scripts and agents
-        --kind <text|image|pdf>   only return this kind of content
+        --kind <text|image|pdf|audio|video>   only return this kind of content
         --all                 also show weak results (see below)
         --hyperlinks <auto|always|never>   clickable paths (default auto)
 sems index [PATH]             index or incrementally update PATH
         --device <auto|cpu|cuda|directml>   (default auto)
         --skip-images         leave images out (see below)
+        --skip-audio          leave audio files out
+        --skip-video          leave videos out
         --rebuild             discard the index and start over
 sems status [PATH]            what is indexed under PATH
 ```
 
-Indexing respects `.gitignore`, skips hidden, binary and large (>1 MB text, >64 MB image or PDF) files,
+Indexing respects `.gitignore`, skips hidden, binary and large (>1 MB text, >64 MB image or PDF) files
+(audio and video have no size limit),
 and reads a `.semsignore` file (same syntax) for anything else to leave out. Re-indexing only
 embeds files whose content changed.
 
@@ -76,6 +92,16 @@ Images (JPEG, PNG, WebP, GIF, BMP, TIFF; not HEIC yet) are embedded from their p
 according to their EXIF orientation. Images under 64 px on a side are skipped as icons. Text and
 images share one ranking: the model scores a photo query highest against the right photo and a
 text query highest against text, so no `--kind` is needed to keep them apart.
+
+Audio (MP3, WAV, M4A, FLAC, Ogg, Opus, AAC, WMA) and video (MP4, MOV, MKV, WebM, AVI, M4V, WMV)
+are decoded with [ffmpeg](https://ffmpeg.org), which must be on `PATH` (`winget install
+Gyan.FFmpeg`) or named by `SEMS_FFMPEG`. Without it, recordings are counted in the summary and
+indexed by the first run that finds ffmpeg. Each result is the stretch of time that matched:
+
+- audio is embedded in 30-second windows every 25 seconds (30 s is the model's limit), so speech
+  cut at one window's edge is whole in the next; silent stretches are skipped;
+- video is embedded from one frame every 3 seconds, three frames per 9-second segment, and its
+  soundtrack is embedded like an audio file, so a video is found by what it shows or what is said.
 
 Searches show only results that stand out: when the similarity curve has a cliff after the top
 matches, everything below it is dropped, so a question with one answer gets one result. A smooth
@@ -91,8 +117,10 @@ Searches always run on the CPU (~1.2 s including model load). Indexing picks the
 that works (`--device auto`): CUDA when the CUDA pack is installed and the NVIDIA driver supports
 it, otherwise DirectML on the high-performance GPU, otherwise the CPU. The summary line names the
 device used. On an RTX 3050 Ti, text indexes about 11x faster with CUDA and 3x with DirectML than on
-the CPU; a 12-megapixel photo takes about 0.3 s with CUDA and 2 s on the CPU. Pass
-`--skip-images` to leave images out of code repositories on CPU-only machines.
+the CPU; a 12-megapixel photo takes about 0.3 s with CUDA and 2 s on the CPU. A minute of
+audio takes about 1.5 s with CUDA and 7 s on the CPU; a minute of video about 5 s with CUDA and
+50 s on the CPU, plus its soundtrack. Pass `--skip-images`, `--skip-audio` or `--skip-video` to
+leave them out on CPU-only machines.
 
 Images are reduced to 140 vision tokens rather than the model's default 280: about 2.3x faster on
 CUDA and 2.6x on the CPU with no loss on the search-quality corpus. The budget is part of the index
@@ -106,7 +134,7 @@ sems keeps everything under `%LOCALAPPDATA%\sems` (`<local data dir>/sems` elsew
 bin\                   sems.exe, on the user PATH (tools\install\install.ps1)
 model\                 exported EmbeddingGemma 2 graphs, tokenizer and config
 runtime\directml\      default ONNX Runtime (~40 MB); also serves CPU, so searches use it
-runtime\cuda\          optional CUDA pack (~900 MB), preferred by `sems index` when the driver supports it
+runtime\cuda\          optional CUDA pack (~1.2 GB), preferred by `sems index` when the driver supports it
 index.db               the index
 ```
 
@@ -116,11 +144,12 @@ index.db               the index
    python -m venv tools/export/.venv
    tools/export/.venv/Scripts/pip install -r tools/export/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
    tools/export/.venv/Scripts/python -c "from huggingface_hub import snapshot_download; snapshot_download('google/embeddinggemma-2', local_dir='models/embeddinggemma-2')"
-   tools/export/.venv/Scripts/python tools/export/make_reference.py --model models/embeddinggemma-2 --out models/reference.json --images tests/fixtures/images/beach.png
-   tools/export/.venv/Scripts/python tools/export/export_onnx.py --model models/embeddinggemma-2 --out models/onnx --reference models/reference.json --image tests/fixtures/images/beach.png
+   tools/export/.venv/Scripts/python tools/export/make_reference.py --model models/embeddinggemma-2 --out models/reference.json --images tests/fixtures/images/beach.png --audio tests/fixtures/eval_corpus/audio/memo_0001.wav tests/fixtures/eval_corpus/audio/memo_0003.m4a --videos tests/fixtures/eval_corpus/videos/clip_0001.mp4
+   tools/export/.venv/Scripts/python tools/export/export_onnx.py --model models/embeddinggemma-2 --out models/onnx --reference models/reference.json --image tests/fixtures/images/beach.png --audio tests/fixtures/eval_corpus/audio/memo_0001.wav tests/fixtures/eval_corpus/audio/memo_0003.m4a --video tests/fixtures/eval_corpus/videos/clip_0001.mp4
    ```
 
    The export fails unless every graph reproduces the official sentence-transformers embeddings.
+   Both scripts decode the audio and video fixtures with ffmpeg, exactly as sems does.
    Then copy `models/onnx/*` into `%LOCALAPPDATA%\sems\model\`.
 
 2. **Install the runtimes**: `python tools/runtime/install_runtime.py directml`, plus
@@ -141,6 +170,7 @@ Every location can be overridden (flags win over environment variables):
 | ONNX Runtime library (any 1.24+ build) | `--onnxruntime` | `SEMS_ONNXRUNTIME` |
 | Index database | `--index` | `SEMS_INDEX` |
 | Indexing device (`auto`, `cpu`, `cuda`, `directml`) | `--device` | `SEMS_DEVICE` |
+| ffmpeg executable (ffprobe must be beside it) | | `SEMS_FFMPEG` |
 
 sems always loads ONNX Runtime by explicit path: Windows ships an outdated `onnxruntime.dll` in
 System32 that loading by name could pick up.
@@ -148,7 +178,7 @@ System32 that loading by name could pick up.
 ## Tests
 
 ```console
-cargo test --release                       # unit and indexing tests (fake encoder, no model needed)
+cargo test --release                       # unit and indexing tests (fake encoder, no model needed; recordings need ffmpeg)
 SEMS_ONNXRUNTIME=$LOCALAPPDATA/sems/runtime/directml/onnxruntime.dll cargo test --release -- --ignored --test-threads=1
 ```
 

@@ -9,10 +9,19 @@ Usage:
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
 from sentence_transformers import SentenceTransformer
+
+# Sibling module shared with export_onnx.py; added explicitly so `python -I` works too.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from media_decoding import decode_audio, decode_video_frames  # noqa: E402
+
+# Video references sample one frame every 8 s at a fixed size; the Rust test decodes identically.
+VIDEO_SECONDS_PER_FRAME = 8
+VIDEO_FRAME_SIZE = (480, 320)
 
 QUERY_PROMPT = "task: search result | query: "
 DOCUMENT_PROMPT = "title: none | text: "
@@ -37,6 +46,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--images", type=Path, nargs="*", default=[])
+    parser.add_argument("--audio", type=Path, nargs="*", default=[])
+    parser.add_argument("--videos", type=Path, nargs="*", default=[])
     return parser.parse_args()
 
 
@@ -77,6 +88,47 @@ def encode_images(model: SentenceTransformer, image_paths: list[Path], out_dir: 
     return references
 
 
+def encode_audio(model: SentenceTransformer, audio_paths: list[Path], out_dir: Path) -> list[dict[str, object]]:
+    """Audio references keep the log-mel features too, so the Rust extractor is checked on its own."""
+    references = []
+    for audio_path in audio_paths:
+        item = {"audio": {"array": decode_audio(audio_path), "sampling_rate": 16000}}
+        features = model.preprocess([item])
+        embedding = model.encode(item, convert_to_numpy=True, normalize_embeddings=True)
+        stem = audio_path.name.replace(".", "_")
+        references.append({
+            "kind": "audio",
+            "input": audio_path.as_posix(),
+            "input_ids": features["input_ids"][0].tolist(),
+            "input_features": write_tensor(features["input_features"], out_dir / f"{stem}.input_features.bin"),
+            "input_features_mask": write_tensor(
+                features["input_features_mask"].to(torch.int64), out_dir / f"{stem}.input_features_mask.bin"),
+            "embedding": embedding.tolist(),
+        })
+    return references
+
+
+def encode_videos(model: SentenceTransformer, video_paths: list[Path], out_dir: Path) -> list[dict[str, object]]:
+    """Video references keep the preprocessed frames, so the model can be checked apart from resizing."""
+    references = []
+    for video_path in video_paths:
+        frames = decode_video_frames(video_path, VIDEO_SECONDS_PER_FRAME, *VIDEO_FRAME_SIZE)
+        item = {"video": frames}
+        features = model.preprocess([item])
+        stem = video_path.name.replace(".", "_")
+        references.append({
+            "kind": "video",
+            "input": video_path.as_posix(),
+            "seconds_per_frame": VIDEO_SECONDS_PER_FRAME,
+            "frame_size": list(VIDEO_FRAME_SIZE),
+            "input_ids": features["input_ids"][0].tolist(),
+            "pixel_values": write_tensor(features["pixel_values_videos"], out_dir / f"{stem}.pixel_values.bin"),
+            "position_ids": write_tensor(features["video_position_ids"], out_dir / f"{stem}.position_ids.bin"),
+            "embedding": model.encode(item, convert_to_numpy=True, normalize_embeddings=True).tolist(),
+        })
+    return references
+
+
 def main() -> None:
     arguments = parse_arguments()
     model = SentenceTransformer(
@@ -84,7 +136,13 @@ def main() -> None:
         device="cpu",
         model_kwargs={"torch_dtype": torch.float32},
     )
-    references = encode_texts(model) + encode_images(model, arguments.images, arguments.out.parent)
+    out_dir = arguments.out.parent
+    references = (
+        encode_texts(model)
+        + encode_images(model, arguments.images, out_dir)
+        + encode_audio(model, arguments.audio, out_dir)
+        + encode_videos(model, arguments.videos, out_dir)
+    )
     arguments.out.write_text(json.dumps(references, ensure_ascii=False), encoding="utf-8")
     print(f"wrote {len(references)} reference embeddings to {arguments.out}")
 

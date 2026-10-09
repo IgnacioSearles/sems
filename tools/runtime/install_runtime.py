@@ -2,11 +2,13 @@
 
     directml  ONNX Runtime 1.24.4 with DirectML (~40 MB). The default runtime: it also serves CPU,
               so searches and non-CUDA indexing use it.
-    cuda      ONNX Runtime 1.30 with CUDA 13 and cuDNN 9 (~890 MB). Optional, for fast indexing on
+    cuda      ONNX Runtime 1.30 with CUDA 13 and cuDNN 9 (~1.2 GB). Optional, for fast indexing on
               NVIDIA GPUs; needs driver 580+.
 
 Downloads the pinned wheels with pip and extracts only the DLLs inference actually loads (measured
 by listing modules loaded during CUDA inference; delay-loaded extras such as cuFFT are left out).
+The cuDNN engine libraries are needed by convolutions (the audio encoder); they were found by
+removing cuDNN libraries one at a time until audio embedding failed.
 Prototype of a future `sems gpu install`.
 
 Usage:
@@ -34,7 +36,15 @@ RUNTIMES: dict[str, dict[str, list[str]]] = {
         ],
         "nvidia-cuda-runtime==13.4.92": ["cudart64_13.dll"],
         "nvidia-cublas==13.8.0.4": ["cublas64_13.dll", "cublasLt64_13.dll"],
-        "nvidia-cudnn-cu13==9.27.0.42": ["cudnn64_9.dll", "cudnn_graph64_9.dll", "cudnn_ops64_9.dll"],
+        "nvidia-cudnn-cu13==9.27.0.42": [
+            "cudnn64_9.dll",
+            "cudnn_graph64_9.dll",
+            "cudnn_ops64_9.dll",
+            "cudnn_heuristic64_9.dll",
+            "cudnn_engines_precompiled64_9.dll",
+            "cudnn_engines_runtime_compiled64_9.dll",
+            "cudnn_engines_tensor_ir64_9.dll",
+        ],
     },
 }
 

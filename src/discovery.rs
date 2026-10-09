@@ -6,6 +6,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 
+use crate::av::{is_audio_path, is_video_path};
 use crate::media::is_image_path;
 
 /// Per-directory ignore file for paths that should stay out of the index but not out of git.
@@ -14,12 +15,15 @@ pub const IGNORE_FILE_NAME: &str = ".semsignore";
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
 /// How a file is indexed: text is chunked and embedded as text, images are embedded from pixels,
-/// and PDFs have their text extracted and chunked page by page.
+/// PDFs have their text extracted and chunked page by page, and recordings are decoded by ffmpeg
+/// and embedded in time segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Text,
     Image,
     Pdf,
+    Audio,
+    Video,
 }
 
 impl FileKind {
@@ -27,8 +31,19 @@ impl FileKind {
         if is_image_path(path) {
             return Self::Image;
         }
+        if is_audio_path(path) {
+            return Self::Audio;
+        }
+        if is_video_path(path) {
+            return Self::Video;
+        }
         let is_pdf = path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
         if is_pdf { Self::Pdf } else { Self::Text }
+    }
+
+    /// Audio and video: indexed as segments of time rather than lines or pages.
+    pub fn is_recording(self) -> bool {
+        matches!(self, Self::Audio | Self::Video)
     }
 }
 
@@ -41,13 +56,35 @@ pub struct DiscoveredFile {
 }
 
 /// Per-kind size limits: a large text file is usually generated data, while large photos and
-/// PDFs are normal.
+/// PDFs are normal. Recordings have no limit: an hour of video is gigabytes, and their cost
+/// depends on duration, not size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryOptions {
     pub max_text_size: u64,
     /// Limit for images and PDFs.
     pub max_media_size: u64,
     pub include_images: bool,
+    pub include_audio: bool,
+    pub include_video: bool,
+}
+
+impl DiscoveryOptions {
+    fn includes(&self, kind: FileKind) -> bool {
+        match kind {
+            FileKind::Text | FileKind::Pdf => true,
+            FileKind::Image => self.include_images,
+            FileKind::Audio => self.include_audio,
+            FileKind::Video => self.include_video,
+        }
+    }
+
+    fn max_size(&self, kind: FileKind) -> u64 {
+        match kind {
+            FileKind::Text => self.max_text_size,
+            FileKind::Image | FileKind::Pdf => self.max_media_size,
+            FileKind::Audio | FileKind::Video => u64::MAX,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -68,14 +105,10 @@ pub fn discover_files(root: &Path, options: &DiscoveryOptions) -> Result<Discove
         let metadata =
             entry.metadata().with_context(|| format!("failed to read metadata of {}", entry.path().display()))?;
         let kind = FileKind::of(entry.path());
-        if kind == FileKind::Image && !options.include_images {
+        if !options.includes(kind) {
             continue;
         }
-        let max_size = match kind {
-            FileKind::Text => options.max_text_size,
-            FileKind::Image | FileKind::Pdf => options.max_media_size,
-        };
-        if metadata.len() > max_size {
+        if metadata.len() > options.max_size(kind) {
             discovery.skipped_too_large += 1;
             continue;
         }
@@ -143,7 +176,13 @@ mod tests {
     }
 
     fn unlimited() -> DiscoveryOptions {
-        DiscoveryOptions { max_text_size: u64::MAX, max_media_size: u64::MAX, include_images: true }
+        DiscoveryOptions {
+            max_text_size: u64::MAX,
+            max_media_size: u64::MAX,
+            include_images: true,
+            include_audio: true,
+            include_video: true,
+        }
     }
 
     #[test]
@@ -151,7 +190,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         write(directory.path(), "photo.JPG", &[b'x'; 100]);
         write(directory.path(), "notes.txt", &[b'x'; 100]);
-        let options = DiscoveryOptions { max_text_size: 50, max_media_size: 1_000, include_images: true };
+        let options = DiscoveryOptions { max_text_size: 50, max_media_size: 1_000, ..unlimited() };
 
         let discovery = discover_files(directory.path(), &options).unwrap();
         assert_eq!(relative_paths(directory.path(), &discovery), ["photo.JPG"]);
@@ -164,6 +203,28 @@ mod tests {
         assert_eq!(FileKind::of(Path::new("Lease.PDF")), FileKind::Pdf);
         assert_eq!(FileKind::of(Path::new("notes.md")), FileKind::Text);
         assert_eq!(FileKind::of(Path::new("photo.jpeg")), FileKind::Image);
+    }
+
+    #[test]
+    fn recordings_have_no_size_limit_and_can_be_excluded() {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path(), "memo.m4a", &[b'x'; 100]);
+        write(directory.path(), "clip.mp4", &[b'x'; 100]);
+        let tiny_limits = DiscoveryOptions { max_text_size: 1, max_media_size: 1, ..unlimited() };
+        let discovery = discover_files(directory.path(), &tiny_limits).unwrap();
+        let kinds: Vec<FileKind> = discovery.files.iter().map(|file| file.kind).collect();
+        assert_eq!(kinds, [FileKind::Video, FileKind::Audio]);
+
+        let without_video = DiscoveryOptions { include_video: false, ..unlimited() };
+        assert_eq!(
+            relative_paths(directory.path(), &discover_files(directory.path(), &without_video).unwrap()),
+            ["memo.m4a"]
+        );
+        let without_audio = DiscoveryOptions { include_audio: false, ..unlimited() };
+        assert_eq!(
+            relative_paths(directory.path(), &discover_files(directory.path(), &without_audio).unwrap()),
+            ["clip.mp4"]
+        );
     }
 
     #[test]

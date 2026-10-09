@@ -10,7 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use sems::embedding::{EmbeddingModel, ExecutionDevice, OnnxRuntime, PreprocessedImage};
+use sems::av::{Ffmpeg, SAMPLE_RATE};
+use sems::embedding::{
+    AudioFeatureExtractor, AudioFeatures, EmbeddingModel, ExecutionDevice, OnnxRuntime, PreprocessedImage,
+};
 use serde::Deserialize;
 
 /// Same bar as the Python export check: anything lower indicates a real numerical divergence.
@@ -24,6 +27,10 @@ struct Reference {
     embedding: Vec<f32>,
     pixel_values: Option<TensorFile>,
     position_ids: Option<TensorFile>,
+    input_features: Option<TensorFile>,
+    input_features_mask: Option<TensorFile>,
+    seconds_per_frame: Option<u32>,
+    frame_size: Option<(u32, u32)>,
 }
 
 #[derive(Deserialize)]
@@ -83,19 +90,31 @@ fn assert_matches_reference(label: &str, actual: &[f32], expected: &[f32]) {
     assert!(similarity >= MINIMUM_COSINE_SIMILARITY, "{label} diverges from reference: {similarity:.6}");
 }
 
+/// Reference preprocessing as one `PreprocessedImage` per frame (images have a single frame).
+fn reference_frames(reference: &Reference) -> Vec<PreprocessedImage> {
+    let pixel_tensor = reference.pixel_values.as_ref().expect("reference without pixel values");
+    let position_tensor = reference.position_ids.as_ref().expect("reference without position ids");
+    let (frames, max_patches, patch_pixels) = (pixel_tensor.shape[0], pixel_tensor.shape[1], pixel_tensor.shape[2]);
+    let pixels = read_f32_tensor(pixel_tensor);
+    let positions = read_i64_tensor(position_tensor);
+    (0..frames)
+        .map(|frame| {
+            let position_ids = positions[frame * max_patches * 2..(frame + 1) * max_patches * 2].to_vec();
+            let real_patches = position_ids.as_chunks::<2>().0.iter().filter(|[x, _]| *x != -1).count();
+            PreprocessedImage {
+                pixel_values: pixels[frame * max_patches * patch_pixels..(frame + 1) * max_patches * patch_pixels]
+                    .to_vec(),
+                position_ids,
+                max_patches,
+                patch_pixels,
+                soft_token_count: real_patches / 9,
+            }
+        })
+        .collect()
+}
+
 fn reference_image(reference: &Reference) -> PreprocessedImage {
-    let pixel_tensor = reference.pixel_values.as_ref().expect("image reference without pixel values");
-    let position_tensor = reference.position_ids.as_ref().expect("image reference without position ids");
-    let max_patches = pixel_tensor.shape[1];
-    let position_ids = read_i64_tensor(position_tensor);
-    let real_patches = position_ids.as_chunks::<2>().0.iter().filter(|[x, _]| *x != -1).count();
-    PreprocessedImage {
-        pixel_values: read_f32_tensor(pixel_tensor),
-        position_ids,
-        max_patches,
-        patch_pixels: pixel_tensor.shape[2],
-        soft_token_count: real_patches / 9,
-    }
+    reference_frames(reference).remove(0)
 }
 
 #[test]
@@ -185,4 +204,132 @@ fn batched_images_match_individual_embeddings() {
         assert_matches_reference(&format!("batch item {index} vs single"), &batched[index], &single);
     }
     assert_matches_reference("batched beach vs reference", &batched[0], &reference.embedding);
+}
+
+fn ffmpeg() -> Ffmpeg {
+    Ffmpeg::locate().expect("audio and video parity tests need ffmpeg on PATH or SEMS_FFMPEG")
+}
+
+fn repository_path(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+/// The first 30 s of a file, decoded like the reference (the model truncates longer audio).
+fn first_audio_window(path: &Path) -> Vec<f32> {
+    let window = 30 * SAMPLE_RATE;
+    let mut samples = None;
+    ffmpeg()
+        .for_each_audio_window(path, window, window, |_, window_samples| {
+            samples.get_or_insert_with(|| window_samples.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    samples.expect("file has audio")
+}
+
+fn reference_audio_features(reference: &Reference) -> AudioFeatures {
+    let features = reference.input_features.as_ref().expect("audio reference without features");
+    let mask = reference.input_features_mask.as_ref().expect("audio reference without mask");
+    AudioFeatures { features: read_f32_tensor(features), mask: read_i64_tensor(mask), frames: features.shape[1] }
+}
+
+#[test]
+#[ignore = "requires exported model and SEMS_ONNXRUNTIME"]
+fn audio_features_match_reference() {
+    let extractor = AudioFeatureExtractor::new();
+    for reference in load_references("audio") {
+        let expected = reference_audio_features(&reference);
+        let ours = extractor.extract(&first_audio_window(&repository_path(&reference.input)));
+        assert_eq!(ours.frames, expected.frames, "{}: frame count", reference.input);
+        assert_eq!(ours.mask, expected.mask, "{}: mask", reference.input);
+        let largest_difference = ours
+            .features
+            .iter()
+            .zip(&expected.features)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        println!("{}: largest log-mel difference {largest_difference:.2e}", reference.input);
+        assert!(largest_difference < 1e-4, "{}: log-mel features diverge by {largest_difference}", reference.input);
+    }
+}
+
+#[test]
+#[ignore = "requires exported model and SEMS_ONNXRUNTIME"]
+fn audio_embeddings_match_reference() {
+    let mut model = load_model();
+    for reference in load_references("audio") {
+        let from_reference_features = model.embed_audio_features(&reference_audio_features(&reference)).unwrap();
+        assert_matches_reference(
+            &format!("{} (reference features)", reference.input),
+            &from_reference_features,
+            &reference.embedding,
+        );
+        let end_to_end = model.embed_audio(&first_audio_window(&repository_path(&reference.input))).unwrap();
+        assert_matches_reference(&format!("{} (rust features)", reference.input), &end_to_end, &reference.embedding);
+    }
+}
+
+/// The reference used the video processor's default of 140 tokens per frame (sems' budget too).
+const VIDEO_TOKEN_BUDGET: usize = 140;
+
+#[test]
+#[ignore = "requires exported model and SEMS_ONNXRUNTIME"]
+fn video_embedding_matches_reference_given_reference_preprocessing() {
+    let mut model = load_model();
+    for reference in load_references("video") {
+        let embedding = model.embed_preprocessed_video(&reference_frames(&reference)).unwrap();
+        assert_matches_reference(
+            &format!("{} (reference preprocessing)", reference.input),
+            &embedding,
+            &reference.embedding,
+        );
+    }
+}
+
+/// End to end the only difference is resizing: within 1/255 of upstream per value, but photographic
+/// frames have far more edge pixels than the synthetic test image, so 5-14% of values differ by
+/// that 1/255 and three frames measured 0.99984. The model itself is held to the strict bar above.
+const MINIMUM_VIDEO_END_TO_END_SIMILARITY: f32 = 0.9995;
+
+#[test]
+#[ignore = "requires exported model and SEMS_ONNXRUNTIME"]
+fn video_embedding_matches_reference_end_to_end() {
+    let mut model = load_model();
+    model.set_vision_token_budget(VIDEO_TOKEN_BUDGET).unwrap();
+    let preprocessor =
+        sems::embedding::ImagePreprocessor::with_token_budget(&model.config().vision_config, VIDEO_TOKEN_BUDGET)
+            .unwrap();
+    for reference in load_references("video") {
+        let (width, height) = reference.frame_size.expect("video reference without frame size");
+        let mut frames = Vec::new();
+        ffmpeg()
+            .for_each_video_frame(
+                &repository_path(&reference.input),
+                reference.seconds_per_frame.expect("video reference without frame interval"),
+                width,
+                height,
+                |_, frame| {
+                    frames.push(image::DynamicImage::ImageRgb8(frame));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        for (ours, theirs) in frames.iter().zip(reference_frames(&reference)) {
+            let ours = preprocessor.preprocess(ours).unwrap();
+            assert_eq!(ours.position_ids, theirs.position_ids, "patch layout differs");
+            let largest =
+                ours.pixel_values.iter().zip(&theirs.pixel_values).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+            assert!(largest * 255.0 <= 1.0 + 1e-3, "frame resize diverges from upstream bicubic: {largest}");
+        }
+
+        let embedding = model.embed_video(&frames).unwrap();
+        let similarity = cosine_similarity(&embedding, &reference.embedding);
+        println!(
+            "{} ({} frames, rust preprocessing): cosine similarity {similarity:.6}",
+            reference.input,
+            frames.len()
+        );
+        assert!(similarity >= MINIMUM_VIDEO_END_TO_END_SIMILARITY, "video diverges from reference: {similarity:.6}");
+    }
 }

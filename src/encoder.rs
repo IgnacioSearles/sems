@@ -25,6 +25,10 @@ pub trait Encoder {
     fn encode_documents(&mut self, documents: &[Document<'_>]) -> Result<Vec<Vec<f32>>>;
     /// Unit-length vector for an image, in the same space as text, so text queries find images.
     fn encode_image(&mut self, image: &DynamicImage) -> Result<Vec<f32>>;
+    /// Unit-length vector for a video segment, given its frames in order.
+    fn encode_video(&mut self, frames: &[DynamicImage]) -> Result<Vec<f32>>;
+    /// Unit-length vector for up to 30 s of 16 kHz mono audio.
+    fn encode_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>>;
 }
 
 /// Prompt formats from the EmbeddingGemma 2 model card (asymmetric retrieval).
@@ -97,6 +101,16 @@ impl Encoder for GemmaEncoder {
     fn encode_image(&mut self, image: &DynamicImage) -> Result<Vec<f32>> {
         // The model card: images take no task prefix.
         let embedding = self.model.embed_image(image)?;
+        Ok(truncate_and_normalize(&embedding, self.config.dimensions))
+    }
+
+    fn encode_video(&mut self, frames: &[DynamicImage]) -> Result<Vec<f32>> {
+        let embedding = self.model.embed_video(frames)?;
+        Ok(truncate_and_normalize(&embedding, self.config.dimensions))
+    }
+
+    fn encode_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
+        let embedding = self.model.embed_audio(samples)?;
         Ok(truncate_and_normalize(&embedding, self.config.dimensions))
     }
 

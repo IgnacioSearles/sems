@@ -1,15 +1,24 @@
 [
   {
     "query": "a cat lying down",
-    "expected": "photos/IMG_0001.jpg"
+    "expected": "photos/IMG_0001.jpg",
+    "also_correct": [
+      "videos/clip_0001.mp4"
+    ]
   },
   {
     "query": "cup of coffee on a saucer",
-    "expected": "photos/IMG_0002.jpg"
+    "expected": "photos/IMG_0002.jpg",
+    "also_correct": [
+      "videos/clip_0001.mp4"
+    ]
   },
   {
     "query": "rocket launching into the sky",
-    "expected": "photos/IMG_0003.jpg"
+    "expected": "photos/IMG_0003.jpg",
+    "also_correct": [
+      "videos/clip_0001.mp4"
+    ]
   },
   {
     "query": "many distant galaxies in deep space",
@@ -37,6 +46,9 @@
   },
   {
     "query": "un gato",
-    "expected": "photos/IMG_0001.jpg"
+    "expected": "photos/IMG_0001.jpg",
+    "also_correct": [
+      "videos/clip_0001.mp4"
+    ]
   }
 ]

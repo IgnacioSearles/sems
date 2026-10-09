@@ -1,3 +1,4 @@
+pub mod av;
 pub mod chunking;
 pub mod device;
 pub mod discovery;
@@ -8,4 +9,5 @@ pub mod indexer;
 pub mod media;
 pub mod render;
 pub mod search;
+pub mod segments;
 pub mod store;

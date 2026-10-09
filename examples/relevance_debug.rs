@@ -4,7 +4,6 @@
 
 use std::path::Path;
 
-use sems::chunking::ChunkingConfig;
 use sems::embedding::{EmbeddingModel, ExecutionDevice, OnnxRuntime};
 use sems::encoder::{Encoder, GemmaEncoder, GemmaEncoderConfig};
 use sems::store::{IndexIdentity, IndexStore, PathScope};
@@ -15,11 +14,7 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("usage: relevance_debug <onnxruntime library> <model dir> <index> <scope> <query>");
     };
     let config = GemmaEncoderConfig::default();
-    let identity = IndexIdentity {
-        encoder: config.identity(),
-        dimensions: config.dimensions,
-        chunker_version: ChunkingConfig::VERSION,
-    };
+    let identity = IndexIdentity::current(config.identity(), config.dimensions);
     let store = IndexStore::open(Path::new(index), identity)?;
     let runtime = OnnxRuntime::load(Path::new(library))?;
     let model = EmbeddingModel::load(runtime, Path::new(model_directory), ExecutionDevice::Cpu)?;
