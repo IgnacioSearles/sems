@@ -51,24 +51,37 @@ sems status [PATH]         what is indexed under PATH
 - Audio and video need [ffmpeg](https://ffmpeg.org) on your `PATH` (`winget install Gyan.FFmpeg`).
 - Indexing uses your GPU when it can. Photos, audio, and video are slow to index without one.
 
-## Install (development)
+## Install
 
-1. **Export the model** (one time, needs Python 3.13):
+On Windows: `powershell -ExecutionPolicy Bypass -File tools\install\install.ps1`. It builds sems,
+sets up ONNX Runtime, and puts `sems` on your PATH. Add `-Cuda` for faster indexing on NVIDIA GPUs,
+or `-Uninstall` to remove it.
 
-   ```console
-   python -m venv tools/export/.venv
-   tools/export/.venv/Scripts/pip install -r tools/export/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-   tools/export/.venv/Scripts/python -c "from huggingface_hub import snapshot_download; snapshot_download('google/embeddinggemma-2', local_dir='models/embeddinggemma-2')"
-   tools/export/.venv/Scripts/python tools/export/make_reference.py --model models/embeddinggemma-2 --out models/reference.json --images tests/fixtures/images/beach.png --audio tests/fixtures/eval_corpus/audio/memo_0001.wav tests/fixtures/eval_corpus/audio/memo_0003.m4a --videos tests/fixtures/eval_corpus/videos/clip_0001.mp4
-   tools/export/.venv/Scripts/python tools/export/export_onnx.py --model models/embeddinggemma-2 --out models/onnx --reference models/reference.json --image tests/fixtures/images/beach.png --audio tests/fixtures/eval_corpus/audio/memo_0001.wav tests/fixtures/eval_corpus/audio/memo_0003.m4a --video tests/fixtures/eval_corpus/videos/clip_0001.mp4
-   ```
-
-2. **Install** (Windows): `powershell -ExecutionPolicy Bypass -File tools\install\install.ps1`.
-   It builds sems, sets up the model and runtime, and puts `sems` on your PATH. Add `-Cuda` for
-   faster indexing on NVIDIA GPUs, or `-Uninstall` to remove it.
+sems downloads its model the first time it needs it: about 550 MB for searching text, plus about
+350 MB for photos and video and about 620 MB for audio. The files come from
+[Hugging Face](https://huggingface.co/neich-cereales/sems-embeddinggemma-2-onnx) and are checked
+against hashes built into sems.
 
 Everything lives in `%LOCALAPPDATA%\sems`. To use other locations, set `SEMS_INDEX`,
-`SEMS_MODEL_DIR`, `SEMS_ONNXRUNTIME`, or `SEMS_FFMPEG` (or the matching flags).
+`SEMS_MODEL_DIR` (a local export, used as is), `SEMS_ONNXRUNTIME`, or `SEMS_FFMPEG` (or the
+matching flags).
+
+## Updating the model
+
+Export it (needs Python 3.13), upload it, then pin the new commit and file hashes in
+`src/model_download.rs`:
+
+```console
+python -m venv tools/export/.venv
+tools/export/.venv/Scripts/pip install -r tools/export/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+tools/export/.venv/Scripts/python -c "from huggingface_hub import snapshot_download; snapshot_download('google/embeddinggemma-2', local_dir='models/embeddinggemma-2')"
+tools/export/.venv/Scripts/python tools/export/make_reference.py --model models/embeddinggemma-2 --out models/reference.json --images tests/fixtures/images/beach.png --audio tests/fixtures/eval_corpus/audio/memo_0001.wav tests/fixtures/eval_corpus/audio/memo_0003.m4a --videos tests/fixtures/eval_corpus/videos/clip_0001.mp4
+tools/export/.venv/Scripts/python tools/export/export_onnx.py --model models/embeddinggemma-2 --out models/onnx --reference models/reference.json --image tests/fixtures/images/beach.png --audio tests/fixtures/eval_corpus/audio/memo_0001.wav tests/fixtures/eval_corpus/audio/memo_0003.m4a --video tests/fixtures/eval_corpus/videos/clip_0001.mp4
+cp tools/export/model_card.md models/onnx/README.md
+hf upload neich-cereales/sems-embeddinggemma-2-onnx models/onnx .
+```
+
+The export fails unless every graph reproduces the official embeddings.
 
 ## Tests
 

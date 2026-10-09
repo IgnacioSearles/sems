@@ -43,23 +43,38 @@ pub enum EmbeddingError {
     Onnx { graph: &'static str, source: ort::Error },
     #[error("unexpected output from {graph}: {message}")]
     UnexpectedOutput { graph: &'static str, message: String },
+    #[error("model file {file} is unavailable: {message}")]
+    ModelFile { file: String, message: String },
 }
 
-/// Locations of the exported runtime artifacts inside a model directory.
-struct ModelFiles {
-    directory: PathBuf,
+/// Where the model's files come from. Files are requested when first needed (the vision and audio
+/// encoders only when an image or recording is embedded), so a source can fetch them lazily.
+pub trait ModelSource: Send + Sync {
+    /// Local path of `file_name` (`config.json`, `text_encoder.onnx`, ...), making it available
+    /// first if needed. A graph's external weights (`<graph>.onnx.data`) must be beside it.
+    fn file(&self, file_name: &str) -> Result<PathBuf, EmbeddingError>;
 }
 
-impl ModelFiles {
-    fn path(&self, file_name: &str) -> PathBuf {
-        self.directory.join(file_name)
+/// A model directory that already holds every file, such as an export or a test fixture.
+pub struct ModelDirectory(pub PathBuf);
+
+impl ModelSource for ModelDirectory {
+    fn file(&self, file_name: &str) -> Result<PathBuf, EmbeddingError> {
+        let path = self.0.join(file_name);
+        if !path.is_file() {
+            return Err(EmbeddingError::ReadFile {
+                path,
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "model file not found"),
+            });
+        }
+        Ok(path)
     }
 }
 
 pub struct EmbeddingModel {
     runtime: OnnxRuntime,
     device: ExecutionDevice,
-    files: ModelFiles,
+    source: Box<dyn ModelSource>,
     config: ModelConfig,
     tokenizer: Tokenizer,
     token_embedder: GraphSession,
@@ -82,14 +97,25 @@ impl EmbeddingModel {
     /// The token embedder always runs on CPU: it is a table lookup, and placing its 512 MB table
     /// on a 4 GB GPU would only take memory from the encoders.
     pub fn load(runtime: OnnxRuntime, model_directory: &Path, device: ExecutionDevice) -> Result<Self, EmbeddingError> {
-        let files = ModelFiles { directory: model_directory.to_path_buf() };
-        let config = ModelConfig::load(&files.path("config.json"))?;
+        Self::load_from(runtime, Box::new(ModelDirectory(model_directory.to_path_buf())), device)
+    }
+
+    /// Like [`Self::load`], with files from any [`ModelSource`]. The text model is loaded now;
+    /// the vision and audio encoders are requested from `source` when first used.
+    pub fn load_from(
+        runtime: OnnxRuntime,
+        source: Box<dyn ModelSource>,
+        device: ExecutionDevice,
+    ) -> Result<Self, EmbeddingError> {
+        let config = ModelConfig::load(&source.file("config.json")?)?;
+        let tokenizer_path = source.file("tokenizer.json")?;
+        let text_encoder_path = source.file("text_encoder.onnx")?;
+        let token_embedder_path = source.file("token_embedder.onnx")?;
         let (tokenizer, token_embedder, text_encoder) = std::thread::scope(|scope| {
-            let tokenizer = scope.spawn(|| load_tokenizer(&files.path("tokenizer.json")));
-            let text_encoder =
-                scope.spawn(|| GraphSession::load(runtime, "text_encoder", &files.path("text_encoder.onnx"), device));
+            let tokenizer = scope.spawn(|| load_tokenizer(&tokenizer_path));
+            let text_encoder = scope.spawn(|| GraphSession::load(runtime, "text_encoder", &text_encoder_path, device));
             let token_embedder =
-                GraphSession::load(runtime, "token_embedder", &files.path("token_embedder.onnx"), ExecutionDevice::Cpu);
+                GraphSession::load(runtime, "token_embedder", &token_embedder_path, ExecutionDevice::Cpu);
             (join_propagating_panic(tokenizer), token_embedder, join_propagating_panic(text_encoder))
         });
         Ok(Self {
@@ -102,7 +128,7 @@ impl EmbeddingModel {
             audio_feature_extractor: AudioFeatureExtractor::new(),
             runtime,
             device,
-            files,
+            source,
             config,
         })
     }
@@ -255,7 +281,7 @@ impl EmbeddingModel {
         if self.audio_encoder.is_none() {
             // Release the vision encoder first: see the `audio_encoder` field.
             self.vision_encoder = None;
-            let path = self.files.path("audio_encoder.onnx");
+            let path = self.source.file("audio_encoder.onnx")?;
             let device = audio_encoder_device(self.device);
             self.audio_encoder = Some(GraphSession::load(self.runtime, "audio_encoder", &path, device)?);
         }
@@ -307,7 +333,7 @@ impl EmbeddingModel {
         if self.vision_encoder.is_none() {
             // Release the audio encoder first: see the `audio_encoder` field.
             self.audio_encoder = None;
-            let path = self.files.path("vision_encoder.onnx");
+            let path = self.source.file("vision_encoder.onnx")?;
             self.vision_encoder = Some(GraphSession::load(self.runtime, "vision_encoder", &path, self.device)?);
         }
         let vision_encoder = self.vision_encoder.as_mut().expect("vision encoder was loaded above");

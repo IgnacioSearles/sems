@@ -7,3 +7,7 @@
 # Python tooling environment
 .venv/
 __pycache__/
+
+# Local AI assistant skills and settings
+/.agents/
+/.claude/

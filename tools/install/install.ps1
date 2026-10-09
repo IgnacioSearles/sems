@@ -3,8 +3,9 @@
 Installs sems for the current user and puts it on the PATH.
 
 .DESCRIPTION
-Builds sems in release mode, copies it to %LOCALAPPDATA%\sems\bin, makes sure the exported model and
-the ONNX Runtime it needs are in %LOCALAPPDATA%\sems, and adds the bin directory to the user PATH.
+Builds sems in release mode, copies it to %LOCALAPPDATA%\sems\bin, makes sure the ONNX Runtime it
+needs is in %LOCALAPPDATA%\sems, and adds the bin directory to the user PATH. sems downloads the
+model itself the first time it needs it.
 Open a new terminal afterwards to pick up the PATH change. Running it again updates the install.
 
 .PARAMETER Cuda
@@ -36,8 +37,6 @@ $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $DataDirectory = Join-Path $env:LOCALAPPDATA 'sems'
 $BinDirectory = Join-Path $DataDirectory 'bin'
 $InstalledExecutable = Join-Path $BinDirectory 'sems.exe'
-# Every graph sems loads; an install from before audio support lacks audio_encoder.onnx.
-$ModelGraphs = @('token_embedder.onnx', 'text_encoder.onnx', 'vision_encoder.onnx', 'audio_encoder.onnx')
 
 # --- User PATH -------------------------------------------------------------------------------------
 # Edited in the registry as REG_EXPAND_SZ, read without expansion, so entries such as %USERPROFILE%\bin
@@ -138,28 +137,6 @@ function Install-Runtime([string]$Flavor) {
     if ($LASTEXITCODE -ne 0) { throw "Installing the $Flavor runtime failed with exit code $LASTEXITCODE" }
 }
 
-function Test-CompleteModel([string]$Directory) {
-    foreach ($graph in $ModelGraphs) {
-        if (-not (Test-Path (Join-Path $Directory $graph))) { return $false }
-    }
-    return $true
-}
-
-function Install-Model {
-    $installedModel = Join-Path $DataDirectory 'model'
-    if (Test-CompleteModel $installedModel) {
-        Write-Host 'Model already installed'
-        return
-    }
-    $exportedModel = Join-Path $RepositoryRoot 'models\onnx'
-    if (-not (Test-CompleteModel $exportedModel)) {
-        throw "No complete exported model in $exportedModel. Export it first (see README, Setup step 1), then run this script again."
-    }
-    Write-Host 'Copying the model (~1.5 GB)...'
-    New-Item -ItemType Directory -Force -Path $installedModel | Out-Null
-    Copy-Item -Path (Join-Path $exportedModel '*') -Destination $installedModel -Force
-}
-
 # sems runs the user's ffmpeg to decode audio and video rather than bundling one.
 function Show-FfmpegStatus {
     if ($env:SEMS_FFMPEG -or (Get-Command 'ffmpeg' -ErrorAction SilentlyContinue)) {
@@ -182,7 +159,6 @@ if ($Uninstall) {
 }
 
 Install-Executable
-Install-Model
 Install-Runtime 'directml'
 if ($Cuda) { Install-Runtime 'cuda' }
 Show-FfmpegStatus

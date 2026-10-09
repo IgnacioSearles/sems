@@ -7,6 +7,7 @@ pub mod embedding;
 pub mod encoder;
 pub mod indexer;
 pub mod media;
+pub mod model_download;
 pub mod render;
 pub mod search;
 pub mod segments;
