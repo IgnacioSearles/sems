@@ -10,8 +10,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # CPU build used by the smoke test; sems needs 1.24 or newer.
-  ONNXRUNTIME_VERSION: "1.30.0"
 
 jobs:
   lint:
@@ -30,19 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            onnxruntime: onnxruntime-win-x64
-            archive: zip
-            library: lib/onnxruntime.dll
-          - os: ubuntu-latest
-            onnxruntime: onnxruntime-linux-x64
-            archive: tgz
-            library: lib/libonnxruntime.so
-          - os: macos-latest
-            onnxruntime: onnxruntime-osx-arm64
-            archive: tgz
-            library: lib/libonnxruntime.dylib
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -62,16 +48,6 @@ jobs:
       - name: Unit and indexing tests
         run: cargo test --release --locked
 
-      - name: Download ONNX Runtime
-        shell: bash
-        run: |
-          name="${{ matrix.onnxruntime }}-$ONNXRUNTIME_VERSION"
-          url="https://github.com/microsoft/onnxruntime/releases/download/v$ONNXRUNTIME_VERSION/$name.${{ matrix.archive }}"
-          cd "$RUNNER_TEMP"
-          curl --fail --silent --show-error --location "$url" --output "onnxruntime.${{ matrix.archive }}"
-          if [ "${{ matrix.archive }}" = zip ]; then unzip -q onnxruntime.zip; else tar -xzf onnxruntime.tgz; fi
-          echo "SEMS_ONNXRUNTIME=$RUNNER_TEMP/$name/${{ matrix.library }}" >> "$GITHUB_ENV"
-
-      - name: Smoke test (downloads the model, indexes and searches on the CPU)
+      - name: Smoke test (downloads ONNX Runtime and the model, indexes and searches on the CPU)
         shell: bash
         run: tools/ci/smoke_test.sh target/release/sems

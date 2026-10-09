@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Semantic search for local files, powered by EmbeddingGemma 2"
 license = "Apache-2.0"
+repository = "https://github.com/IgnacioSearles/sems"
 
 [dependencies]
 anyhow = "1.0"
@@ -40,9 +41,17 @@ thiserror = "2.0"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 # Blocking HTTPS (rustls) for the one-time model download; no async runtime needed.
 ureq = "3"
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
+tar = "0.4.46"
+flate2 = "1.1.10"
 
 [dev-dependencies]
 tempfile = "3.27"
 
 [profile.release]
 debug = "line-tables-only"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

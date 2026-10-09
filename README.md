@@ -53,18 +53,33 @@ sems status [PATH]         what is indexed under PATH
 
 ## Install
 
-On Windows: `powershell -ExecutionPolicy Bypass -File tools\install\install.ps1`. It builds sems,
-sets up ONNX Runtime, and puts `sems` on your PATH. Add `-Cuda` for faster indexing on NVIDIA GPUs,
-or `-Uninstall` to remove it.
+macOS (Apple silicon) and Linux (x64):
 
-sems downloads its model the first time it needs it: about 550 MB for searching text, plus about
-350 MB for photos and video and about 620 MB for audio. The files come from
-[Hugging Face](https://huggingface.co/neich-cereales/sems-embeddinggemma-2-onnx) and are checked
-against hashes built into sems.
+```console
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/IgnacioSearles/sems/releases/latest/download/sems-installer.sh | sh
+```
 
-Everything lives in `%LOCALAPPDATA%\sems`. To use other locations, set `SEMS_INDEX`,
-`SEMS_MODEL_DIR` (a local export, used as is), `SEMS_ONNXRUNTIME`, or `SEMS_FFMPEG` (or the
-matching flags).
+Windows (x64):
+
+```console
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/IgnacioSearles/sems/releases/latest/download/sems-installer.ps1 | iex"
+```
+
+The first time it needs them, sems downloads ONNX Runtime (15–40 MB) and its model: about 550 MB
+for searching text, plus about 350 MB for photos and video and about 620 MB for audio. Everything
+comes from official sources and is checked against hashes built into sems. It lives in your local
+data folder (`%LOCALAPPDATA%\sems`, `~/.local/share/sems`, or `~/Library/Application Support/sems`).
+To use other locations, set `SEMS_INDEX`, `SEMS_MODEL_DIR` (a local export, used as is),
+`SEMS_ONNXRUNTIME`, or `SEMS_FFMPEG` (or the matching flags).
+
+For faster indexing on NVIDIA GPUs, add the CUDA pack: `python tools/runtime/install_runtime.py cuda`.
+
+To build from this checkout on Windows: `powershell -ExecutionPolicy Bypass -File tools\install\install.ps1`.
+
+## Releasing
+
+Set the new version in `Cargo.toml`, commit, then tag and push it (`git tag v0.2.0 && git push --tags`).
+The release workflow builds every platform and publishes the GitHub release with the installers.
 
 ## Updating the model
 

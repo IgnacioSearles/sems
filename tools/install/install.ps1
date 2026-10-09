@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-Installs sems for the current user and puts it on the PATH.
+Installs sems from this checkout for the current user and puts it on the PATH.
 
 .DESCRIPTION
-Builds sems in release mode, copies it to %LOCALAPPDATA%\sems\bin, makes sure the ONNX Runtime it
-needs is in %LOCALAPPDATA%\sems, and adds the bin directory to the user PATH. sems downloads the
-model itself the first time it needs it.
+For development; users install a release instead (see the README). Builds sems in release mode,
+copies it to %LOCALAPPDATA%\sems\bin, and adds that directory to the user PATH. sems downloads ONNX
+Runtime and the model itself the first time it needs them.
 Open a new terminal afterwards to pick up the PATH change. Running it again updates the install.
 
 .PARAMETER Cuda
@@ -159,7 +159,6 @@ if ($Uninstall) {
 }
 
 Install-Executable
-Install-Runtime 'directml'
 if ($Cuda) { Install-Runtime 'cuda' }
 Show-FfmpegStatus
 

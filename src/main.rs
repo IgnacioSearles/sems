@@ -9,11 +9,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use sems::av::Ffmpeg;
 use sems::device::{DeviceChoice, RuntimeLayout, cuda_driver_supports, plan_runtime};
 use sems::discovery::{DiscoveryOptions, FileKind};
+use sems::download::DownloadProgress;
 use sems::embedding::{EmbeddingModel, ExecutionDevice, ModelDirectory, ModelSource, OnnxRuntime};
 use sems::encoder::{Encoder, GemmaEncoder, GemmaEncoderConfig};
 use sems::indexer::{IndexOptions, IndexProgress, IndexSummary, index_directory};
-use sems::model_download::{DownloadProgress, DownloadedModel};
+use sems::model_download::DownloadedModel;
 use sems::render::{OutputFormat, Style, display_path, render};
+use sems::runtime_download;
 use sems::search::{SearchOptions, search};
 use sems::store::{IndexIdentity, IndexStore, PathScope};
 
@@ -157,7 +159,7 @@ struct Locations {
     /// Directory with an exported model, used as is [default: downloaded into <local data dir>/sems/model]
     #[arg(long, global = true, env = "SEMS_MODEL_DIR")]
     model_dir: Option<PathBuf>,
-    /// ONNX Runtime library [default: the installed runtime for the device, see `--device`]
+    /// ONNX Runtime library [default: downloaded into <local data dir>/sems/runtime, see `--device`]
     #[arg(long, global = true, env = "SEMS_ONNXRUNTIME")]
     onnxruntime: Option<PathBuf>,
 }
@@ -177,7 +179,7 @@ impl Locations {
             Some(directory) => Ok(Box::new(ModelDirectory(directory.clone()))),
             None => Ok(Box::new(DownloadedModel::new(
                 data_directory()?.join("model"),
-                Box::new(TerminalDownloadProgress { redraw: std::io::stderr().is_terminal() }),
+                Box::new(TerminalDownloadProgress::new()),
             ))),
         }
     }
@@ -222,8 +224,10 @@ fn index_identity() -> IndexIdentity {
 
 /// Loads the model on the first device in the plan that works, and reports which one it was.
 fn load_encoder(locations: &Locations, choice: DeviceChoice) -> Result<(GemmaEncoder, ExecutionDevice)> {
+    let layout = locations.runtime_layout()?;
+    let default_runtime = || runtime_download::default_runtime(&layout, &TerminalDownloadProgress::new());
     let plan =
-        plan_runtime(choice, locations.onnxruntime.as_deref(), &locations.runtime_layout()?, &cuda_driver_supports)?;
+        plan_runtime(choice, locations.onnxruntime.as_deref(), &layout, &cuda_driver_supports, &default_runtime)?;
     let runtime = OnnxRuntime::load(&plan.library)?;
     let mut failures = Vec::new();
     for &device in &plan.devices {
@@ -373,25 +377,31 @@ fn write_stdout(text: &str) -> Result<()> {
     }
 }
 
-/// Model download progress on stderr: a line redrawn in place on a terminal, otherwise one line
-/// per file so logs stay readable.
+/// Download progress (model and ONNX Runtime) on stderr: a line redrawn in place on a terminal,
+/// otherwise one line per file so logs stay readable.
 struct TerminalDownloadProgress {
     redraw: bool,
+}
+
+impl TerminalDownloadProgress {
+    fn new() -> Self {
+        Self { redraw: std::io::stderr().is_terminal() }
+    }
 }
 
 impl DownloadProgress for TerminalDownloadProgress {
     fn started(&self, file_name: &str, size: u64) {
         if self.redraw {
-            eprint!("\rdownloading model: {file_name} ({})   ", readable_size(size));
+            eprint!("\rdownloading {file_name} ({})   ", readable_size(size));
         } else {
-            eprintln!("downloading model: {file_name} ({})", readable_size(size));
+            eprintln!("downloading {file_name} ({})", readable_size(size));
         }
     }
 
     fn advanced(&self, file_name: &str, downloaded: u64, size: u64) {
         if self.redraw {
             let percent = downloaded * 100 / size.max(1);
-            eprint!("\rdownloading model: {file_name} ({}) {percent}%   ", readable_size(size));
+            eprint!("\rdownloading {file_name} ({}) {percent}%   ", readable_size(size));
         }
     }
 

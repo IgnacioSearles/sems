@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runs a sems binary end to end on the CPU: downloads the pinned model, indexes a code file, a
-# photo and a voice memo, and checks that a description of each finds it first. Needs ffmpeg and
-# SEMS_ONNXRUNTIME (an ONNX Runtime 1.24+ library).
+# Runs a sems binary end to end on the CPU: downloads ONNX Runtime and the pinned model, indexes a
+# code file, a photo and a voice memo, and checks that a description of each finds it first. Needs
+# ffmpeg.
 #
 #     tools/ci/smoke_test.sh target/release/sems
 set -euo pipefail
