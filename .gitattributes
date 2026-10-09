@@ -6,3 +6,5 @@
 *.mp3 binary
 *.m4a binary
 *.mp4 binary
+# Shell scripts run under bash on every CI runner, which rejects CRLF line endings.
+*.sh text eol=lf
