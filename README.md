@@ -103,6 +103,7 @@ identity, so changing it requires `sems index --rebuild`.
 sems keeps everything under `%LOCALAPPDATA%\sems` (`<local data dir>/sems` elsewhere):
 
 ```text
+bin\                   sems.exe, on the user PATH (tools\install\install.ps1)
 model\                 exported EmbeddingGemma 2 graphs, tokenizer and config
 runtime\directml\      default ONNX Runtime (~40 MB); also serves CPU, so searches use it
 runtime\cuda\          optional CUDA pack (~900 MB), preferred by `sems index` when the driver supports it
@@ -126,7 +127,11 @@ index.db               the index
    `python tools/runtime/install_runtime.py cuda` for NVIDIA GPUs (CUDA 13 needs driver 580+). Each
    runtime keeps its dependencies in its own folder; nothing goes on `PATH`.
 
-3. **Build and run**: `cargo build --release`, then `target/release/sems index`.
+3. **Install** (Windows): `powershell -ExecutionPolicy Bypass -File tools\install\install.ps1`
+   builds sems, copies it to `%LOCALAPPDATA%\sems\bin`, installs the DirectML runtime and copies the
+   model if they are missing, and adds that directory to your user PATH. Open a new terminal and
+   run `sems index`. Add `-Cuda` for the CUDA pack; run it again to update; `-Uninstall` removes
+   sems and the PATH entry but keeps the model and index.
 
 Every location can be overridden (flags win over environment variables):
 
