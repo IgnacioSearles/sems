@@ -9,7 +9,7 @@ Runtime and the model itself the first time it needs them.
 Open a new terminal afterwards to pick up the PATH change. Running it again updates the install.
 
 .PARAMETER Cuda
-Also install the optional CUDA runtime pack (~1.2 GB, NVIDIA driver 580+) for fast indexing.
+Also install the optional CUDA pack (`sems gpu install`, ~1 GB, NVIDIA driver 580+) for fast indexing.
 
 .PARAMETER SkipBuild
 Install the already built target\release\sems.exe instead of building it.
@@ -99,14 +99,6 @@ function Find-Cargo {
     throw 'cargo was not found. Install Rust from https://rustup.rs, or pass -SkipBuild with a built target\release\sems.exe.'
 }
 
-function Find-Python {
-    $repositoryPython = Join-Path $RepositoryRoot 'tools\export\.venv\Scripts\python.exe'
-    if (Test-Path $repositoryPython) { return @($repositoryPython) }
-    if (Get-Command py -ErrorAction SilentlyContinue) { return @('py', '-3') }
-    if (Get-Command python -ErrorAction SilentlyContinue) { return @('python') }
-    throw 'Python 3 is needed to download ONNX Runtime (tools\runtime\install_runtime.py) but was not found.'
-}
-
 function Install-Executable {
     $built = Join-Path $RepositoryRoot 'target\release\sems.exe'
     if (-not $SkipBuild) {
@@ -124,17 +116,9 @@ function Install-Executable {
     Write-Host "Installed $InstalledExecutable"
 }
 
-function Install-Runtime([string]$Flavor) {
-    $library = Join-Path $DataDirectory "runtime\$Flavor\onnxruntime.dll"
-    if (Test-Path $library) {
-        Write-Host "ONNX Runtime ($Flavor) already installed"
-        return
-    }
-    Write-Host "Installing ONNX Runtime ($Flavor)..."
-    $python = Find-Python
-    $arguments = @($python | Select-Object -Skip 1) + @((Join-Path $RepositoryRoot 'tools\runtime\install_runtime.py'), $Flavor)
-    & $python[0] @arguments
-    if ($LASTEXITCODE -ne 0) { throw "Installing the $Flavor runtime failed with exit code $LASTEXITCODE" }
+function Install-CudaPack {
+    & $InstalledExecutable gpu install
+    if ($LASTEXITCODE -ne 0) { throw "Installing the CUDA pack failed with exit code $LASTEXITCODE" }
 }
 
 # sems runs the user's ffmpeg to decode audio and video rather than bundling one.
@@ -159,7 +143,7 @@ if ($Uninstall) {
 }
 
 Install-Executable
-if ($Cuda) { Install-Runtime 'cuda' }
+if ($Cuda) { Install-CudaPack }
 Show-FfmpegStatus
 
 if (Add-ToUserPath $BinDirectory) {

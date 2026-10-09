@@ -1,0 +1,31 @@
+name: Runtime packs
+
+# Downloads and extracts every pinned ONNX Runtime package (the default runtime and the ~1 GB CUDA
+# pack) on each platform, proving the URLs, hashes and archive paths. GitHub's runners have no
+# GPU, so this checks the packs, not CUDA inference. Runs only when the pins change, or on demand.
+on:
+  push:
+    branches: [main]
+    paths: ["src/runtime_download/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  packs:
+    name: packs (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install every pinned package for this platform
+        run: cargo test --release --locked --lib runtime_download -- --ignored --test-threads=1

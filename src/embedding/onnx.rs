@@ -67,8 +67,54 @@ fn search_directory_for_dependencies(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Other platforms resolve dependencies through the library's rpath.
-#[cfg(not(windows))]
+/// Loads the CUDA and cuDNN libraries beside ONNX Runtime globally, before it asks for them.
+///
+/// The CUDA provider and cuDNN find their dependencies by soname (`libcublasLt.so.13`, and cuDNN
+/// opens its sub-libraries at runtime), and those wheels' libraries carry no rpath pointing at
+/// each other. A library already loaded with `RTLD_GLOBAL` satisfies such lookups, which is how
+/// Python's onnxruntime handles the same wheels. Their dependencies on each other are resolved by
+/// retrying until no further library loads.
+///
+/// Only NVIDIA's libraries are loaded, and only beside a CUDA build of ONNX Runtime, so pointing
+/// `--onnxruntime` at a system directory never loads unrelated libraries.
+#[cfg(target_os = "linux")]
+fn search_directory_for_dependencies(directory: &Path) -> std::io::Result<()> {
+    use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+
+    const CUDA_PROVIDER: &str = "libonnxruntime_providers_cuda.so";
+    const NVIDIA_LIBRARY_PREFIXES: [&str; 4] = ["libcudart.so.", "libcublas", "libcurand.so.", "libcudnn"];
+    if !directory.join(CUDA_PROVIDER).is_file() {
+        return Ok(());
+    }
+    let mut pending: Vec<std::path::PathBuf> = std::fs::read_dir(directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            NVIDIA_LIBRARY_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        // SAFETY: these are the pinned NVIDIA libraries of the CUDA pack; loading them runs only
+        // their own initializers. They stay loaded for the life of the process, as ONNX Runtime
+        // expects of its dependencies.
+        pending.retain(|path| match unsafe { Library::open(Some(path), RTLD_NOW | RTLD_GLOBAL) } {
+            Ok(library) => {
+                std::mem::forget(library);
+                false
+            }
+            Err(_) => true,
+        });
+        if pending.len() == before {
+            let names: Vec<_> = pending.iter().map(|path| path.display().to_string()).collect();
+            return Err(std::io::Error::other(format!("cannot load {}", names.join(", "))));
+        }
+    }
+    Ok(())
+}
+
+/// macOS has no CUDA; its runtime directory holds only ONNX Runtime.
+#[cfg(not(any(windows, target_os = "linux")))]
 fn search_directory_for_dependencies(_directory: &Path) -> std::io::Result<()> {
     Ok(())
 }

@@ -58,7 +58,7 @@ pub struct RuntimeLayout {
     /// Directory of the sems executable; a runtime placed there is used as the default one.
     pub executable_directory: PathBuf,
     /// `<data dir>/runtime`, holding the default runtime (`directml/` or `cpu/`) and the optional
-    /// `cuda/` pack (tools/runtime/install_runtime.py).
+    /// `cuda/` pack (`sems gpu install`).
     pub runtimes_directory: PathBuf,
 }
 
@@ -84,16 +84,15 @@ pub struct RuntimePlan {
     pub devices: Vec<ExecutionDevice>,
 }
 
-/// Decides which runtime to load. `cuda_usable` reports whether the driver can run the CUDA
-/// build installed in the given directory (see [`cuda_driver_supports`]), and `default_runtime`
-/// provides the default runtime's library, downloading it if needed; both are parameters so the
-/// decision can be tested without a GPU or a network, and nothing is downloaded unless the plan
-/// uses it.
+/// Decides which runtime to load. `cuda_usable` reports whether the NVIDIA driver can run the CUDA
+/// pack (see [`nvidia_driver_supports_cuda`]), and `default_runtime` provides the default
+/// runtime's library, downloading it if needed; both are parameters so the decision can be tested
+/// without a GPU or a network, and nothing is probed or downloaded unless the plan needs it.
 pub fn plan_runtime(
     choice: DeviceChoice,
     explicit_library: Option<&Path>,
     layout: &RuntimeLayout,
-    cuda_usable: &dyn Fn(&Path) -> bool,
+    cuda_usable: &dyn Fn() -> bool,
     default_runtime: &dyn Fn() -> Result<PathBuf>,
 ) -> Result<RuntimePlan> {
     use ExecutionDevice::{Cpu, Cuda, DirectMl};
@@ -114,8 +113,7 @@ pub fn plan_runtime(
         DeviceChoice::Exactly(Cuda) => {
             let library = layout.cuda_library().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "the CUDA pack is not installed in {}; install it with \
-                     `python tools/runtime/install_runtime.py cuda` or set --onnxruntime",
+                    "the CUDA pack is not installed in {}; install it with `sems gpu install`",
                     layout.runtimes_directory.join("cuda").display()
                 )
             })?;
@@ -123,7 +121,7 @@ pub fn plan_runtime(
         }
         DeviceChoice::Exactly(device) => plan(default_runtime()?, vec![device]),
         DeviceChoice::Auto => {
-            let usable_cuda = layout.cuda_library().filter(|library| library.parent().is_some_and(cuda_usable));
+            let usable_cuda = layout.cuda_library().filter(|_| cuda_usable());
             if let Some(library) = usable_cuda {
                 return plan(library, vec![Cuda, Cpu]);
             }
@@ -138,36 +136,41 @@ pub fn plan_runtime(
     }
 }
 
-/// CUDA runtime shipped in the CUDA pack (pinned in tools/runtime/install_runtime.py).
+/// The NVIDIA driver's CUDA library, installed with the driver itself (not part of the pack).
 #[cfg(windows)]
-const CUDA_RUNTIME_LIBRARY: &str = "cudart64_13.dll";
+const NVIDIA_DRIVER_LIBRARY: &str = "nvcuda.dll";
 #[cfg(not(windows))]
-const CUDA_RUNTIME_LIBRARY: &str = "libcudart.so.13";
+const NVIDIA_DRIVER_LIBRARY: &str = "libcuda.so.1";
 /// The pack is built against CUDA 13; drivers report their version as `major * 1000 + minor * 10`.
 const MINIMUM_DRIVER_CUDA_VERSION: i32 = 13_000;
 
-/// Asks the NVIDIA driver, through the pack's CUDA runtime, whether it supports CUDA 13 and sees
-/// a GPU. False (never an error) when there is no driver, it is too old, or no GPU is present.
-pub fn cuda_driver_supports(runtime_directory: &Path) -> bool {
+/// Asks the NVIDIA driver whether it supports CUDA 13 and sees a GPU, without the CUDA pack, so
+/// `sems gpu install` can check before downloading. False (never an error) when there is no
+/// driver, it is too old, or no GPU is present.
+pub fn nvidia_driver_supports_cuda() -> bool {
+    type CudaInit = unsafe extern "C" fn(u32) -> i32;
     type CudaQuery = unsafe extern "C" fn(*mut i32) -> i32;
     const CUDA_SUCCESS: i32 = 0;
 
-    // SAFETY: loading the CUDA runtime runs only its own initializers. Both functions take an out
-    // pointer to an int and return a status code, per the CUDA runtime API; the out pointers are
-    // valid locals.
+    // SAFETY: loading the driver library runs only its own initializers. Per the CUDA driver API,
+    // cuInit takes flags (must be 0) and the queries take an out pointer to an int; all return a
+    // status code, and the out pointers are valid locals.
     unsafe {
-        let Ok(library) = libloading::Library::new(runtime_directory.join(CUDA_RUNTIME_LIBRARY)) else {
+        let Ok(library) = libloading::Library::new(NVIDIA_DRIVER_LIBRARY) else {
             return false;
         };
-        let (Ok(driver_version), Ok(device_count)) =
-            (library.get::<CudaQuery>(b"cudaDriverGetVersion\0"), library.get::<CudaQuery>(b"cudaGetDeviceCount\0"))
-        else {
+        let (Ok(initialize), Ok(driver_version), Ok(device_count)) = (
+            library.get::<CudaInit>(b"cuInit\0"),
+            library.get::<CudaQuery>(b"cuDriverGetVersion\0"),
+            library.get::<CudaQuery>(b"cuDeviceGetCount\0"),
+        ) else {
             return false;
         };
         let mut version = 0;
         let mut devices = 0;
         driver_version(&mut version) == CUDA_SUCCESS
             && version >= MINIMUM_DRIVER_CUDA_VERSION
+            && initialize(0) == CUDA_SUCCESS
             && device_count(&mut devices) == CUDA_SUCCESS
             && devices > 0
     }
@@ -211,7 +214,7 @@ mod tests {
         let default = default_library(installed);
         let default_runtime =
             move || if default_available { Ok(default.clone()) } else { Err(anyhow::anyhow!("offline")) };
-        plan_runtime(choice, None, &installed.layout, &|_| cuda_works, &default_runtime)
+        plan_runtime(choice, None, &installed.layout, &|| cuda_works, &default_runtime)
     }
 
     #[test]
@@ -242,14 +245,14 @@ mod tests {
     fn a_working_cuda_pack_needs_no_default_runtime() {
         let installed = installed(true);
         let never = || -> Result<PathBuf> { panic!("the default runtime was requested") };
-        plan_runtime(DeviceChoice::Auto, None, &installed.layout, &|_| true, &never).unwrap();
+        plan_runtime(DeviceChoice::Auto, None, &installed.layout, &|| true, &never).unwrap();
     }
 
     #[test]
     fn requesting_cuda_without_the_pack_explains_how_to_install_it() {
         let installed = installed(false);
         let error = plan(DeviceChoice::Exactly(Cuda), &installed, true, true).unwrap_err().to_string();
-        assert!(error.contains("install_runtime.py cuda"), "unexpected error: {error}");
+        assert!(error.contains("sems gpu install"), "unexpected error: {error}");
     }
 
     #[test]
@@ -257,10 +260,10 @@ mod tests {
         let installed = installed(true);
         let library = installed.layout.flavor_library("cuda");
         let never = || -> Result<PathBuf> { panic!("the default runtime was requested") };
-        let auto = plan_runtime(DeviceChoice::Auto, Some(&library), &installed.layout, &|_| true, &never).unwrap();
+        let auto = plan_runtime(DeviceChoice::Auto, Some(&library), &installed.layout, &|| true, &never).unwrap();
         assert_eq!((auto.library, auto.devices), (library.clone(), vec![Cuda, DirectMl, Cpu]));
         let missing = installed.layout.runtimes_directory.join("nope.dll");
-        assert!(plan_runtime(DeviceChoice::Auto, Some(&missing), &installed.layout, &|_| true, &never).is_err());
+        assert!(plan_runtime(DeviceChoice::Auto, Some(&missing), &installed.layout, &|| true, &never).is_err());
     }
 
     #[test]
@@ -271,8 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn cuda_probe_is_false_without_a_cuda_runtime() {
-        let directory = tempfile::tempdir().unwrap();
-        assert!(!cuda_driver_supports(directory.path()));
+    fn auto_does_not_probe_the_driver_without_the_cuda_pack() {
+        let installed = installed(false);
+        let probed = std::cell::Cell::new(false);
+        let probe = || {
+            probed.set(true);
+            true
+        };
+        let default = default_library(&installed);
+        plan_runtime(DeviceChoice::Auto, None, &installed.layout, &probe, &|| Ok(default.clone())).unwrap();
+        assert!(!probed.get(), "initializing the driver costs time; skip it when the pack is absent");
     }
 }

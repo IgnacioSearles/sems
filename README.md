@@ -42,6 +42,8 @@ sems index [PATH]          index PATH, or update it after changes
         --skip-images, --skip-audio, --skip-video
         --rebuild          start the index over
 sems status [PATH]         what is indexed under PATH
+sems gpu install           faster indexing on NVIDIA GPUs (Windows, Linux; ~1 GB download)
+sems gpu remove            delete it again
 ```
 
 - Indexing skips whatever `.gitignore` or a `.semsignore` file lists, plus hidden and binary files.
@@ -72,7 +74,9 @@ data folder (`%LOCALAPPDATA%\sems`, `~/.local/share/sems`, or `~/Library/Applica
 To use other locations, set `SEMS_INDEX`, `SEMS_MODEL_DIR` (a local export, used as is),
 `SEMS_ONNXRUNTIME`, or `SEMS_FFMPEG` (or the matching flags).
 
-For faster indexing on NVIDIA GPUs, add the CUDA pack: `python tools/runtime/install_runtime.py cuda`.
+With an NVIDIA GPU (driver 580 or newer), `sems gpu install` adds the CUDA pack, and indexing then
+runs several times faster. Other GPUs are used through DirectML on Windows; on macOS sems runs on
+the CPU.
 
 To build from this checkout on Windows: `powershell -ExecutionPolicy Bypass -File tools\install\install.ps1`.
 

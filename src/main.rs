@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use sems::av::Ffmpeg;
-use sems::device::{DeviceChoice, RuntimeLayout, cuda_driver_supports, plan_runtime};
+use sems::device::{DeviceChoice, RuntimeLayout, nvidia_driver_supports_cuda, plan_runtime};
 use sems::discovery::{DiscoveryOptions, FileKind};
 use sems::download::DownloadProgress;
 use sems::embedding::{EmbeddingModel, ExecutionDevice, ModelDirectory, ModelSource, OnnxRuntime};
@@ -15,7 +15,7 @@ use sems::encoder::{Encoder, GemmaEncoder, GemmaEncoderConfig};
 use sems::indexer::{IndexOptions, IndexProgress, IndexSummary, index_directory};
 use sems::model_download::DownloadedModel;
 use sems::render::{OutputFormat, Style, display_path, render};
-use sems::runtime_download;
+use sems::runtime_download::{self, CUDA_FLAVOR};
 use sems::search::{SearchOptions, search};
 use sems::store::{IndexIdentity, IndexStore, PathScope};
 
@@ -40,6 +40,19 @@ enum Command {
         /// Directory to report on [default: current directory]
         path: Option<PathBuf>,
     },
+    /// Manage the CUDA pack, which runs indexing on NVIDIA GPUs (Windows and Linux).
+    Gpu {
+        #[command(subcommand)]
+        action: GpuAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GpuAction {
+    /// Download the CUDA pack (about 1 GB, NVIDIA driver 580 or newer); `sems index` then uses it.
+    Install,
+    /// Delete the CUDA pack.
+    Remove,
 }
 
 #[derive(Args)]
@@ -206,6 +219,8 @@ fn main() -> ExitCode {
     let outcome = match &cli.command {
         Some(Command::Index(arguments)) => run_index(arguments, &cli.locations),
         Some(Command::Status { path }) => run_status(path.as_deref(), &cli.locations),
+        Some(Command::Gpu { action: GpuAction::Install }) => run_gpu_install(&cli.locations),
+        Some(Command::Gpu { action: GpuAction::Remove }) => run_gpu_remove(&cli.locations),
         None => run_search(&cli.search, &cli.locations),
     };
     match outcome {
@@ -226,8 +241,13 @@ fn index_identity() -> IndexIdentity {
 fn load_encoder(locations: &Locations, choice: DeviceChoice) -> Result<(GemmaEncoder, ExecutionDevice)> {
     let layout = locations.runtime_layout()?;
     let default_runtime = || runtime_download::default_runtime(&layout, &TerminalDownloadProgress::new());
-    let plan =
-        plan_runtime(choice, locations.onnxruntime.as_deref(), &layout, &cuda_driver_supports, &default_runtime)?;
+    let plan = plan_runtime(
+        choice,
+        locations.onnxruntime.as_deref(),
+        &layout,
+        &nvidia_driver_supports_cuda,
+        &default_runtime,
+    )?;
     let runtime = OnnxRuntime::load(&plan.library)?;
     let mut failures = Vec::new();
     for &device in &plan.devices {
@@ -331,6 +351,41 @@ fn run_status(path: Option<&Path>, locations: &Locations) -> Result<()> {
         statistics.chunks,
         index_path.display()
     ))
+}
+
+/// Checks the driver before downloading: the pack is about 1 GB and useless without it.
+fn run_gpu_install(locations: &Locations) -> Result<()> {
+    let layout = locations.runtime_layout()?;
+    let download_size = runtime_download::cuda_pack_download_size()?;
+    if runtime_download::is_cuda_pack_installed(&layout) {
+        eprintln!("the CUDA pack is already installed in {}", layout.runtimes_directory.join(CUDA_FLAVOR).display());
+        return Ok(());
+    }
+    if !nvidia_driver_supports_cuda() {
+        bail!(
+            "no NVIDIA GPU with a driver that supports CUDA 13 was found; the CUDA pack needs an NVIDIA GPU and \
+             driver 580 or newer (other GPUs are used through DirectML on Windows)"
+        );
+    }
+    eprintln!("downloading the CUDA pack ({})", readable_size(download_size));
+    let library = runtime_download::install_cuda_pack(&layout, &TerminalDownloadProgress::new())?;
+    eprintln!("installed the CUDA pack in {}; `sems index` now uses your NVIDIA GPU", display_parent(&library));
+    Ok(())
+}
+
+fn run_gpu_remove(locations: &Locations) -> Result<()> {
+    let directory = locations.runtime_layout()?.runtimes_directory.join(CUDA_FLAVOR);
+    if !directory.exists() {
+        eprintln!("the CUDA pack is not installed");
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&directory).with_context(|| format!("failed to delete {}", directory.display()))?;
+    eprintln!("removed the CUDA pack from {}", directory.display());
+    Ok(())
+}
+
+fn display_parent(path: &Path) -> String {
+    path.parent().unwrap_or(path).display().to_string()
 }
 
 fn summary_line(root: &Path, summary: &IndexSummary, dimensions: usize, device: ExecutionDevice) -> String {
