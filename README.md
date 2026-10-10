@@ -3,6 +3,8 @@
 Semantic search for your files: like `grep`, but it matches meaning instead of exact text. It
 searches code, documents, PDFs, photos, audio, and video, all locally.
 
+![sems searching a folder of photos and videos, with the top result shown beside the terminal](docs/demo.webp)
+
 ```console
 > sems index
 > sems "how do we retry failed requests"
