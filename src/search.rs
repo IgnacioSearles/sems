@@ -10,7 +10,7 @@
 //! per-modality calibration is needed.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -130,14 +130,44 @@ pub fn search(
     options: SearchOptions,
 ) -> Result<Vec<SearchResult>> {
     let query_vector = encoder.encode_query(query)?;
-    let (semantic, background) =
-        store.nearest_chunks_with_background(scope, &query_vector, CANDIDATES_PER_RETRIEVER, options.kind)?;
     // Images and recordings carry no text, so keyword retrieval only ever contributes text chunks.
     let has_text = options.kind.is_none_or(|kind| matches!(kind, FileKind::Text | FileKind::Pdf));
     let keyword = match keyword_query(query) {
         Some(fts_query) if has_text => store.keyword_chunks(scope, &fts_query, CANDIDATES_PER_RETRIEVER)?,
         _ => Vec::new(),
     };
+    rank(store, scope, &query_vector, &keyword, &[], options)
+}
+
+/// Files like an example (`sems similar`), given its embedding (see [`crate::example`]). The
+/// example's own chunks are left out: it would always be its own best match.
+pub fn search_similar(
+    store: &IndexStore,
+    scope: &PathScope,
+    example_vector: &[f32],
+    example_path: &Path,
+    options: SearchOptions,
+) -> Result<Vec<SearchResult>> {
+    let excluded = store.chunk_ids_of_file(example_path)?;
+    rank(store, scope, example_vector, &[], &excluded, options)
+}
+
+/// Fuses semantic candidates for `query_vector` with `keyword` matches and applies the relevance
+/// cutoff and de-duplication. `excluded` chunks are removed before the cutoff is computed.
+fn rank(
+    store: &IndexStore,
+    scope: &PathScope,
+    query_vector: &[f32],
+    keyword: &[(i64, f32)],
+    excluded: &[i64],
+    options: SearchOptions,
+) -> Result<Vec<SearchResult>> {
+    let candidates = CANDIDATES_PER_RETRIEVER + excluded.len();
+    let (mut semantic, background) =
+        store.nearest_chunks_with_background(scope, query_vector, candidates, options.kind)?;
+    semantic.retain(|(id, _)| !excluded.contains(id));
+    semantic.truncate(CANDIDATES_PER_RETRIEVER);
+    let keyword = keyword.to_vec();
 
     let semantic_similarities: Vec<f32> = semantic.iter().map(|(_, similarity)| *similarity).collect();
     let floor = relevance_floor(&semantic_similarities, background.standard_deviation(), CLIFF_IN_STANDARD_DEVIATIONS)
@@ -150,7 +180,7 @@ pub fn search(
             break;
         }
         let chunk = store.chunk(chunk_id)?;
-        let similarity = dot_product(&query_vector, &chunk.embedding);
+        let similarity = dot_product(query_vector, &chunk.embedding);
         let path = chunk.path.clone();
         let content = ResultContent::from_chunk(chunk)?;
         // Exact keyword matches are evidence on their own, and the best result always shows.

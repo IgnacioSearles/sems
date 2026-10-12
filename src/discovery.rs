@@ -27,7 +27,7 @@ pub enum FileKind {
 }
 
 impl FileKind {
-    fn of(path: &Path) -> Self {
+    pub fn of(path: &Path) -> Self {
         if is_image_path(path) {
             return Self::Image;
         }
@@ -57,8 +57,9 @@ pub struct DiscoveredFile {
 
 /// Per-kind size limits: a large text file is usually generated data, while large photos and
 /// PDFs are normal. Recordings have no limit: an hour of video is gigabytes, and their cost
-/// depends on duration, not size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// depends on duration, not size. Stored with each indexed folder, so later checks for changes
+/// look at the same files the index did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiscoveryOptions {
     pub max_text_size: u64,
     /// Limit for images and PDFs.
@@ -90,7 +91,10 @@ impl DiscoveryOptions {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Discovery {
     pub files: Vec<DiscoveredFile>,
-    pub skipped_too_large: usize,
+    /// Over the size limit for their kind.
+    pub too_large: Vec<PathBuf>,
+    /// Of a kind the options exclude (for example images with --skip-images).
+    pub left_out: usize,
 }
 
 /// Lists regular files under `root` without reading their contents.
@@ -106,10 +110,11 @@ pub fn discover_files(root: &Path, options: &DiscoveryOptions) -> Result<Discove
             entry.metadata().with_context(|| format!("failed to read metadata of {}", entry.path().display()))?;
         let kind = FileKind::of(entry.path());
         if !options.includes(kind) {
+            discovery.left_out += 1;
             continue;
         }
         if metadata.len() > options.max_size(kind) {
-            discovery.skipped_too_large += 1;
+            discovery.too_large.push(entry.into_path());
             continue;
         }
         discovery.files.push(DiscoveredFile {
@@ -120,6 +125,7 @@ pub fn discover_files(root: &Path, options: &DiscoveryOptions) -> Result<Discove
         });
     }
     discovery.files.sort_by(|left, right| left.path.cmp(&right.path));
+    discovery.too_large.sort();
     Ok(discovery)
 }
 
@@ -195,7 +201,7 @@ mod tests {
         let discovery = discover_files(directory.path(), &options).unwrap();
         assert_eq!(relative_paths(directory.path(), &discovery), ["photo.JPG"]);
         assert_eq!(discovery.files[0].kind, FileKind::Image);
-        assert_eq!(discovery.skipped_too_large, 1);
+        assert_eq!(discovery.too_large.len(), 1);
     }
 
     #[test]
@@ -235,6 +241,7 @@ mod tests {
         let options = DiscoveryOptions { include_images: false, ..unlimited() };
         let discovery = discover_files(directory.path(), &options).unwrap();
         assert_eq!(relative_paths(directory.path(), &discovery), ["notes.txt"]);
+        assert_eq!(discovery.left_out, 1);
     }
 
     #[test]
@@ -246,7 +253,7 @@ mod tests {
         let options = DiscoveryOptions { max_text_size: 50, ..unlimited() };
         let discovery = discover_files(directory.path(), &options).unwrap();
         assert_eq!(relative_paths(directory.path(), &discovery), ["small.txt"]);
-        assert_eq!(discovery.skipped_too_large, 1);
+        assert_eq!(discovery.too_large.len(), 1);
     }
 
     #[test]

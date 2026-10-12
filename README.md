@@ -40,16 +40,22 @@ sems <QUERY> [PATH]        search under PATH (default: current directory)
         --json             results as JSON, for scripts and coding agents
         --kind <KIND>      only text, image, pdf, audio, or video
         --all              also show weak results
+sems similar FILE [PATH]   files like FILE: photos like a photo, notes like a note
+                           (same options as a search; FILE need not be indexed)
 sems index [PATH]          index PATH, or update it after changes
         --skip-images, --skip-audio, --skip-video
         --rebuild          start the index over
-sems status [PATH]         what is indexed under PATH
+sems status [PATH]         every indexed folder, or what is and is not indexed under PATH
+        --list             every file that is not indexed (PATH defaults to . here)
+sems forget PATH           remove a folder from the index (it may already be deleted)
 sems gpu install           faster indexing on NVIDIA GPUs (Windows, Linux; ~1 GB download)
 sems gpu remove            delete it again
 ```
 
 - Indexing skips whatever `.gitignore` or a `.semsignore` file lists, plus hidden and binary files.
   Re-indexing only processes files that changed.
+- Searches keep themselves current: a few edited or deleted text files are updated before
+  searching, and new photos or recordings get a reminder to run `sems index`.
 - Searches show only the results that clearly stand out; `--all` shows everything.
 - Result paths are clickable in terminals that support links.
 - Audio and video need [ffmpeg](https://ffmpeg.org) on your `PATH` (`winget install Gyan.FFmpeg`).

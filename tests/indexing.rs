@@ -8,10 +8,12 @@ use image::DynamicImage;
 use sems::av::{Ffmpeg, SAMPLE_RATE};
 use sems::discovery::FileKind;
 use sems::encoder::{Document, Encoder};
+use sems::example::example_embedding;
+use sems::freshness::{Freshness, PendingChanges, pending_changes, refresh_before_search, scan_folder};
 use sems::indexer::{IndexOptions, IndexSummary, SilentProgress, index_directory};
-use sems::search::{ResultContent, SearchOptions, SearchResult, search};
+use sems::search::{ResultContent, SearchOptions, SearchResult, search, search_similar};
 use sems::segments::{MediaSegmentation, TimeSpan};
-use sems::store::{IndexIdentity, IndexStore, PathScope};
+use sems::store::{IndexIdentity, IndexStore, PathScope, SkipReason};
 
 const DIMENSIONS: usize = 64;
 
@@ -463,4 +465,151 @@ fn videos_are_indexed_by_frames_and_soundtrack() {
     // AAC adds a few milliseconds of encoder padding to the decoded soundtrack.
     assert_eq!(tone.start_milliseconds, 0);
     assert!((7_900..8_100).contains(&tone.end_milliseconds), "soundtrack span {tone:?}");
+}
+
+impl Fixture {
+    /// Indexes like `sems index`, recording the folder so later searches can check for changes.
+    fn index_recorded(&mut self) -> IndexSummary {
+        let summary = self.index();
+        self.store.record_indexed_root(&self.root, &IndexOptions::default().discovery, 0).unwrap();
+        summary
+    }
+
+    fn similar_to(&mut self, example: &Path) -> Vec<PathBuf> {
+        let segmentation = MediaSegmentation::default();
+        let vector = example_embedding(&self.store, &mut self.encoder, example, None, &segmentation).unwrap();
+        let scope = PathScope::new(&self.root);
+        let options = SearchOptions { relevance_cutoff: false, ..SearchOptions::default() };
+        let results = search_similar(&self.store, &scope, &vector, example, options).unwrap();
+        results.iter().map(|result| relative(&self.root, &result.path)).collect()
+    }
+
+    fn refresh(&mut self) -> Freshness {
+        let options = IndexOptions::default();
+        let root = self.root.clone();
+        refresh_before_search(&mut self.store, &mut self.encoder, &root, &options, &mut SilentProgress).unwrap()
+    }
+}
+
+#[test]
+fn similar_files_rank_first_and_the_example_is_left_out() {
+    let mut fixture = Fixture::new();
+    fixture.write("fruit.txt", "apple banana cherry");
+    fixture.write("more_fruit.txt", "apple banana cherry grape");
+    fixture.write("rockets.txt", "rocket engine launch orbit");
+    fixture.index();
+
+    let similar = fixture.similar_to(&fixture.root.join("fruit.txt"));
+    assert_eq!(similar.first(), Some(&PathBuf::from("more_fruit.txt")));
+    assert!(!similar.contains(&PathBuf::from("fruit.txt")), "the example is not its own result");
+}
+
+#[test]
+fn an_indexed_photo_is_compared_by_its_stored_vectors() {
+    let mut fixture = Fixture::new();
+    fixture.write_image("sunset.png", [220, 40, 30], 100);
+    fixture.write_image("brick.png", [200, 60, 20], 100);
+    fixture.write_image("forest.png", [20, 180, 40], 100);
+    fixture.index();
+    let images_before = fixture.encoder.images_encoded;
+
+    let similar = fixture.similar_to(&fixture.root.join("sunset.png"));
+    assert_eq!(similar.first(), Some(&PathBuf::from("brick.png")));
+    assert_eq!(fixture.encoder.images_encoded, images_before, "no model work for an indexed photo");
+}
+
+#[test]
+fn a_file_outside_the_index_can_be_the_example() {
+    let mut fixture = Fixture::new();
+    fixture.write("fruit.txt", "apple banana cherry");
+    fixture.write("rockets.txt", "rocket engine launch orbit");
+    fixture.write_image("red.png", [220, 40, 30], 100);
+    fixture.write_image("blue.png", [30, 40, 220], 100);
+    fixture.index();
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let note = elsewhere.path().join("note.txt");
+    std::fs::write(&note, "an orbit launch").unwrap();
+    assert_eq!(fixture.similar_to(&note).first(), Some(&PathBuf::from("rockets.txt")));
+    let photo = elsewhere.path().join("sunset.png");
+    image::RgbImage::from_pixel(100, 100, image::Rgb([200, 60, 20])).save(&photo).unwrap();
+    assert_eq!(fixture.similar_to(&photo).first(), Some(&PathBuf::from("red.png")));
+}
+
+#[test]
+fn searches_pick_up_small_text_changes_and_report_media_changes() {
+    let mut fixture = Fixture::new();
+    fixture.write("notes.txt", "meeting about the budget");
+    fixture.write("todo.txt", "buy groceries");
+    fixture.index_recorded();
+    assert_eq!(fixture.refresh(), Freshness::UpToDate);
+
+    fixture.write("notes.txt", "meeting about the offsite venue and travel");
+    std::fs::remove_file(fixture.root.join("todo.txt")).unwrap();
+    let expected = PendingChanges { modified_files: 1, removed_files: 1, ..PendingChanges::default() };
+    assert_eq!(fixture.refresh(), Freshness::Updated(expected));
+    assert_eq!(fixture.top_result("offsite venue"), Some(PathBuf::from("notes.txt")));
+    assert_eq!(fixture.store.statistics(&PathScope::new(&fixture.root)).unwrap().files, 1);
+
+    fixture.write_image("whiteboard.png", [20, 180, 40], 100);
+    let stale = PendingChanges { new_files: 1, new_or_modified_media: 1, ..PendingChanges::default() };
+    assert_eq!(fixture.refresh(), Freshness::Stale(stale), "photos take seconds each; `sems index` embeds them");
+    assert_eq!(fixture.encoder.images_encoded, 0);
+}
+
+#[test]
+fn changes_are_judged_with_the_options_the_folder_was_indexed_with() {
+    let mut fixture = Fixture::new();
+    fixture.write("readme.txt", "hello");
+    fixture.write_image("photo.png", [220, 40, 30], 100);
+    let mut without_images = IndexOptions::default();
+    without_images.discovery.include_images = false;
+    fixture.index_with(&without_images);
+
+    let as_indexed = pending_changes(&fixture.store, &fixture.root, &without_images.discovery).unwrap();
+    assert!(as_indexed.is_empty(), "a folder indexed with --skip-images has no new photos: {as_indexed:?}");
+    let with_defaults = pending_changes(&fixture.store, &fixture.root, &IndexOptions::default().discovery).unwrap();
+    assert_eq!(with_defaults.new_or_modified_media, 1);
+}
+
+#[test]
+fn a_folder_scan_lists_every_file_that_is_not_indexed() {
+    let mut fixture = Fixture::new();
+    fixture.write("kept.txt", "still here");
+    fixture.write("edited.txt", "first draft");
+    fixture.write("gone.txt", "about to be deleted");
+    std::fs::write(fixture.root.join("program.bin"), b"MZ\x90\x00\x03").unwrap();
+    fixture.write_image("icon.png", [0, 0, 255], 16);
+    fixture.write("huge.log", &"x".repeat(2 * 1024 * 1024));
+    let mut options = IndexOptions::default();
+    options.discovery.include_audio = false;
+    fixture.write("memo.wav", "not really audio");
+    fixture.index_with(&options);
+
+    fixture.write("new.txt", "a new note");
+    fixture.write("edited.txt", "second draft, longer");
+    std::fs::remove_file(fixture.root.join("gone.txt")).unwrap();
+    let scan = scan_folder(&fixture.store, &fixture.root, &options.discovery).unwrap();
+
+    let names = |paths: &[PathBuf]| -> Vec<String> {
+        paths.iter().map(|path| relative(&fixture.root, path).display().to_string()).collect()
+    };
+    assert_eq!(names(&scan.new_files), ["new.txt"]);
+    assert_eq!(names(&scan.modified_files), ["edited.txt"]);
+    assert_eq!(names(&scan.deleted_files), ["gone.txt"]);
+    assert_eq!(names(&scan.too_large), ["huge.log"]);
+    assert_eq!(scan.left_out, 1, "memo.wav, with audio excluded");
+    let skipped: Vec<(String, Option<SkipReason>)> = scan
+        .skipped_files
+        .iter()
+        .map(|file| (relative(&fixture.root, &file.path).display().to_string(), file.reason))
+        .collect();
+    assert_eq!(
+        skipped,
+        [
+            ("icon.png".to_string(), Some(SkipReason::ImageTooSmall)),
+            ("program.bin".to_string(), Some(SkipReason::Binary)),
+        ]
+    );
+    assert_eq!(scan.not_indexed(), 6, "new, edited, huge, memo, and the two skipped");
 }

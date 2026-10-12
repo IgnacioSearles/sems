@@ -6,6 +6,8 @@ pub mod documents;
 pub mod download;
 pub mod embedding;
 pub mod encoder;
+pub mod example;
+pub mod freshness;
 pub mod indexer;
 pub mod media;
 pub mod model_download;

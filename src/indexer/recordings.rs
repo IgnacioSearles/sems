@@ -18,7 +18,7 @@ use crate::av::{DecodeError, Ffmpeg, MediaInfo, SAMPLE_RATE};
 use crate::discovery::FileKind;
 use crate::encoder::Encoder;
 use crate::segments::{MediaSegmentation, TimeSpan, fit_within, is_silent};
-use crate::store::{FileRecord, IndexStore};
+use crate::store::{FileRecord, IndexStore, SkipReason};
 
 /// An audio or video file whose content changed, waiting to be decoded.
 pub(super) struct PendingRecording {
@@ -63,7 +63,7 @@ pub(super) fn embed_recordings(
         match unless_unreadable(ffmpeg.probe(&file.path))? {
             Some(info) => recordings.push(Recording { file, info, segments: Vec::new(), decoding_failed: false }),
             None => {
-                store.record_skipped_file(&file.path, &file.record)?;
+                store.record_skipped_file(&file.path, &file.record, SkipReason::RecordingUnreadable)?;
                 summary.recordings_unreadable += 1;
             }
         }
@@ -192,7 +192,9 @@ fn embed_soundtrack(
 fn store_recording(store: &mut IndexStore, recording: Recording, summary: &mut IndexSummary) -> Result<()> {
     let Recording { file, segments, decoding_failed, .. } = recording;
     if segments.is_empty() {
-        store.record_skipped_file(&file.path, &file.record)?;
+        let reason =
+            if decoding_failed { SkipReason::RecordingUnreadable } else { SkipReason::RecordingWithoutContent };
+        store.record_skipped_file(&file.path, &file.record, reason)?;
         if decoding_failed {
             summary.recordings_unreadable += 1;
         } else {

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::chunking::{Chunk, ChunkingConfig};
-use crate::discovery::FileKind;
+use crate::discovery::{DiscoveryOptions, FileKind};
 use crate::segments::{MediaSegmentation, TimeSpan};
 
 /// Bumped whenever the schema changes incompatibly.
@@ -38,6 +38,19 @@ const SCHEMA: &str = "
         embedding   BLOB NOT NULL
     );
     CREATE INDEX IF NOT EXISTS chunks_by_file ON chunks(file_id);
+
+    -- Folders indexed with `sems index`, the options used, and when (seconds since the Unix
+    -- epoch). Added after schema 4 shipped; creating it is compatible with older version-4 indexes.
+    -- Why a tracked file produced no chunks. Also added after schema 4 shipped.
+    CREATE TABLE IF NOT EXISTS skipped_files (
+        file_id  INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        reason   TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS indexed_roots (
+        path        TEXT PRIMARY KEY,
+        options     TEXT NOT NULL,
+        indexed_at  INTEGER NOT NULL
+    );
 
     -- External-content FTS5 index over chunks.text; '_' is a token character so snake_case
     -- identifiers match as whole words.
@@ -94,6 +107,63 @@ pub struct ChunkRecord {
     pub end_line: usize,
     pub text: String,
     pub embedding: Vec<f32>,
+}
+
+/// Why a file was tracked without being embedded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SkipReason {
+    Binary,
+    ImageTooSmall,
+    ImageUnreadable,
+    PdfWithoutText,
+    PdfUnreadable,
+    RecordingUnreadable,
+    /// Silent, or too short for a segment.
+    RecordingWithoutContent,
+}
+
+impl SkipReason {
+    const ALL: [Self; 7] = [
+        Self::Binary,
+        Self::ImageTooSmall,
+        Self::ImageUnreadable,
+        Self::PdfWithoutText,
+        Self::PdfUnreadable,
+        Self::RecordingUnreadable,
+        Self::RecordingWithoutContent,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::ImageTooSmall => "image_too_small",
+            Self::ImageUnreadable => "image_unreadable",
+            Self::PdfWithoutText => "pdf_without_text",
+            Self::PdfUnreadable => "pdf_unreadable",
+            Self::RecordingUnreadable => "recording_unreadable",
+            Self::RecordingWithoutContent => "recording_without_content",
+        }
+    }
+
+    fn parse(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.key() == key)
+    }
+}
+
+/// A file in the index that produced no chunks. `reason` is `None` for files skipped before sems
+/// recorded reasons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    pub path: PathBuf,
+    pub reason: Option<SkipReason>,
+}
+
+/// A folder indexed with `sems index`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedRoot {
+    pub path: PathBuf,
+    pub options: DiscoveryOptions,
+    pub indexed_at_seconds: i64,
 }
 
 /// Counts only files that produced chunks; skipped files (binary, tiny images) are tracked but
@@ -166,6 +236,12 @@ impl PathScope {
         };
         let directory_prefix_characters = directory_prefix.chars().count() as i64;
         Self { exact, directory_prefix, directory_prefix_characters }
+    }
+
+    /// Whether `path` is the scope's root or lies under it.
+    pub fn contains(&self, path: &Path) -> bool {
+        let key = path_key(path);
+        key == self.exact || key.starts_with(&self.directory_prefix)
     }
 
     /// SQL condition on `files.path` (aliased `f`) using parameters `:scope_exact`,
@@ -289,13 +365,13 @@ impl IndexStore {
                 embedding,
             })
             .collect();
-        self.write_file(path, record, &rows)
+        self.write_file(path, record, &rows, None)
     }
 
     /// Stores an image as a single chunk holding its embedding.
     pub fn replace_image_file(&mut self, path: &Path, record: &FileRecord, embedding: &[f32]) -> Result<()> {
         let row = ChunkRow::without_text(FileKind::Image, None, embedding);
-        self.write_file(path, record, &[row])
+        self.write_file(path, record, &[row], None)
     }
 
     /// Replaces an audio or video file's chunks, one per embedded stretch of time.
@@ -309,7 +385,7 @@ impl IndexStore {
         ensure!(kind.is_recording(), "{kind:?} is not a recording kind");
         let rows: Vec<ChunkRow<'_>> =
             segments.iter().map(|(span, embedding)| ChunkRow::without_text(kind, Some(*span), embedding)).collect();
-        self.write_file(path, record, &rows)
+        self.write_file(path, record, &rows, None)
     }
 
     /// Replaces a PDF's chunks; each carries its 1-based page number.
@@ -331,16 +407,41 @@ impl IndexStore {
                 embedding,
             })
             .collect();
-        self.write_file(path, record, &rows)
+        self.write_file(path, record, &rows, None)
     }
 
     /// Tracks a file that produced no chunks (binary, unreadable, too small), so unchanged runs
     /// skip it by metadata instead of re-reading it every time.
-    pub fn record_skipped_file(&mut self, path: &Path, record: &FileRecord) -> Result<()> {
-        self.write_file(path, record, &[])
+    pub fn record_skipped_file(&mut self, path: &Path, record: &FileRecord, reason: SkipReason) -> Result<()> {
+        self.write_file(path, record, &[], Some(reason))
     }
 
-    fn write_file(&mut self, path: &Path, record: &FileRecord, rows: &[ChunkRow<'_>]) -> Result<()> {
+    /// Files under `scope` that produced no chunks, by path.
+    pub fn skipped_files(&self, scope: &PathScope) -> Result<Vec<SkippedFile>> {
+        let sql = format!(
+            "SELECT f.path, s.reason FROM files f LEFT JOIN skipped_files s ON s.file_id = f.id
+             WHERE {} AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+             ORDER BY f.path",
+            PathScope::CONDITION
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(scope.parameters().as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        rows.map(|row| {
+            let (path, reason) = row?;
+            Ok(SkippedFile { path: PathBuf::from(path), reason: reason.as_deref().and_then(SkipReason::parse) })
+        })
+        .collect()
+    }
+
+    fn write_file(
+        &mut self,
+        path: &Path,
+        record: &FileRecord,
+        rows: &[ChunkRow<'_>],
+        skip_reason: Option<SkipReason>,
+    ) -> Result<()> {
         for row in rows {
             ensure!(
                 row.embedding.len() == self.identity.dimensions,
@@ -359,6 +460,13 @@ impl IndexStore {
             params![path_key(path), record.size as i64, record.modified_nanoseconds, record.content_hash],
             |row| row.get(0),
         )?;
+        transaction.execute("DELETE FROM skipped_files WHERE file_id = ?1", [file_id])?;
+        if let Some(reason) = skip_reason {
+            transaction.execute(
+                "INSERT INTO skipped_files(file_id, reason) VALUES (?1, ?2)",
+                params![file_id, reason.key()],
+            )?;
+        }
         {
             let mut insert = transaction.prepare(
                 "INSERT INTO chunks(file_id, kind, page, start_milliseconds, end_milliseconds, start_line,
@@ -396,6 +504,91 @@ impl IndexStore {
         delete_chunks_of(&transaction, path)?;
         transaction.execute("DELETE FROM files WHERE path = ?1", [path_key(path)])?;
         transaction.commit().with_context(|| format!("failed to remove {} from the index", path.display()))
+    }
+
+    /// Records that `root` was indexed with `options`. Indexed folders inside it are merged into
+    /// it; a folder inside an already indexed one is covered by that one and not recorded.
+    pub fn record_indexed_root(
+        &mut self,
+        root: &Path,
+        options: &DiscoveryOptions,
+        indexed_at_seconds: i64,
+    ) -> Result<()> {
+        let existing = self.indexed_roots()?;
+        let covered =
+            existing.iter().any(|indexed| indexed.path != root && PathScope::new(&indexed.path).contains(root));
+        if covered {
+            return Ok(());
+        }
+        let scope = PathScope::new(root);
+        let transaction = self.connection.transaction()?;
+        for inner in existing.iter().filter(|indexed| scope.contains(&indexed.path)) {
+            transaction.execute("DELETE FROM indexed_roots WHERE path = ?1", [path_key(&inner.path)])?;
+        }
+        transaction.execute(
+            "INSERT INTO indexed_roots(path, options, indexed_at) VALUES (?1, ?2, ?3)",
+            params![path_key(root), serde_json::to_string(options)?, indexed_at_seconds],
+        )?;
+        transaction.commit().context("failed to record the indexed folder")
+    }
+
+    /// Every indexed folder, sorted by path.
+    pub fn indexed_roots(&self) -> Result<Vec<IndexedRoot>> {
+        let mut statement =
+            self.connection.prepare("SELECT path, options, indexed_at FROM indexed_roots ORDER BY path")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?;
+        rows.map(|row| {
+            let (path, options, indexed_at_seconds) = row?;
+            let options = serde_json::from_str(&options).with_context(|| format!("corrupt options for {path}"))?;
+            Ok(IndexedRoot { path: PathBuf::from(path), options, indexed_at_seconds })
+        })
+        .collect()
+    }
+
+    /// The indexed folder that `path` is in (or is), if any.
+    pub fn indexed_root_containing(&self, path: &Path) -> Result<Option<IndexedRoot>> {
+        Ok(self.indexed_roots()?.into_iter().find(|root| PathScope::new(&root.path).contains(path)))
+    }
+
+    /// Removes every file under `scope` and the indexed folders inside it; returns how many files
+    /// were removed (including tracked files that produced no chunks).
+    pub fn forget(&mut self, scope: &PathScope) -> Result<usize> {
+        let inner_roots: Vec<IndexedRoot> =
+            self.indexed_roots()?.into_iter().filter(|root| scope.contains(&root.path)).collect();
+        let transaction = self.connection.transaction()?;
+        let in_scope = format!("SELECT f.id FROM files f WHERE {}", PathScope::CONDITION);
+        transaction
+            .execute(&format!("DELETE FROM chunks WHERE file_id IN ({in_scope})"), scope.parameters().as_slice())?;
+        let removed = transaction
+            .execute(&format!("DELETE FROM files WHERE id IN ({in_scope})"), scope.parameters().as_slice())?;
+        for root in inner_roots {
+            transaction.execute("DELETE FROM indexed_roots WHERE path = ?1", [path_key(&root.path)])?;
+        }
+        transaction.commit().context("failed to remove files from the index")?;
+        Ok(removed)
+    }
+
+    /// Returns the space freed by removals to the file system (rewrites the database).
+    pub fn compact(&self) -> Result<()> {
+        self.connection.execute_batch("VACUUM").context("failed to compact the index")
+    }
+
+    /// Every chunk embedding stored for `path`, in insertion order.
+    pub fn embeddings_of_file(&self, path: &Path) -> Result<Vec<Vec<f32>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT c.embedding FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.path = ?1 ORDER BY c.id",
+        )?;
+        let rows = statement.query_map([path_key(path)], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|blob| decode_vector(&blob?)).collect()
+    }
+
+    /// Ids of every chunk stored for `path`.
+    pub fn chunk_ids_of_file(&self, path: &Path) -> Result<Vec<i64>> {
+        let mut statement =
+            self.connection.prepare("SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.path = ?1")?;
+        let rows = statement.query_map([path_key(path)], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<_>>().context("failed to list a file's chunks")
     }
 
     /// Exact nearest neighbours by cosine similarity (vectors are unit length, so a dot product),
@@ -735,14 +928,81 @@ mod tests {
         assert!(store.replace_recording_file(&path, &record(1), FileKind::Image, &segments).is_err());
     }
 
+    fn options() -> DiscoveryOptions {
+        DiscoveryOptions {
+            max_text_size: 1,
+            max_media_size: 2,
+            include_images: false,
+            include_audio: true,
+            include_video: true,
+        }
+    }
+
+    #[test]
+    fn indexed_roots_keep_their_options_and_merge_when_nested() {
+        let mut store = IndexStore::open_in_memory(identity()).unwrap();
+        let photos = root().join("photos");
+        store.record_indexed_root(&photos.join("2024"), &options(), 1).unwrap();
+        store.record_indexed_root(&root().join("photos-old"), &options(), 2).unwrap();
+        store.record_indexed_root(&photos, &options(), 3).unwrap();
+        store.record_indexed_root(&photos.join("2025"), &options(), 4).unwrap();
+
+        let paths: Vec<PathBuf> = store.indexed_roots().unwrap().into_iter().map(|indexed| indexed.path).collect();
+        assert_eq!(paths, [photos.clone(), root().join("photos-old")], "2024 merged into photos; 2025 covered by it");
+        let containing = store.indexed_root_containing(&photos.join("2025/beach.jpg")).unwrap().unwrap();
+        assert_eq!((containing.path, containing.options, containing.indexed_at_seconds), (photos, options(), 3));
+        assert!(store.indexed_root_containing(&root().join("elsewhere")).unwrap().is_none());
+    }
+
+    #[test]
+    fn forgetting_a_folder_removes_its_files_and_inner_roots_only() {
+        let mut store = IndexStore::open_in_memory(identity()).unwrap();
+        let work = root().join("work");
+        store.replace_text_file(&work.join("a.txt"), &record(1), &[chunk("forgotten", [1.0, 0.0])]).unwrap();
+        store.record_skipped_file(&work.join("blob.bin"), &record(2), SkipReason::Binary).unwrap();
+        store.replace_text_file(&root().join("workshop/b.txt"), &record(3), &[chunk("kept", [0.0, 1.0])]).unwrap();
+        store.record_indexed_root(&work, &options(), 1).unwrap();
+        store.record_indexed_root(&root().join("workshop"), &options(), 1).unwrap();
+
+        assert_eq!(store.forget(&PathScope::new(&work)).unwrap(), 2);
+        let everything = PathScope::new(&root());
+        assert_eq!(store.statistics(&everything).unwrap().files, 1);
+        assert!(store.keyword_chunks(&everything, "\"forgotten\"", 10).unwrap().is_empty());
+        let roots: Vec<PathBuf> = store.indexed_roots().unwrap().into_iter().map(|indexed| indexed.path).collect();
+        assert_eq!(roots, [root().join("workshop")]);
+        store.compact().unwrap();
+    }
+
+    #[test]
+    fn a_files_embeddings_can_be_read_back() {
+        let mut store = IndexStore::open_in_memory(identity()).unwrap();
+        let path = root().join("two.txt");
+        store.replace_text_file(&path, &record(1), &[chunk("a", [1.0, 0.0]), chunk("b", [0.0, 1.0])]).unwrap();
+        assert_eq!(store.embeddings_of_file(&path).unwrap(), [vec![1.0, 0.0], vec![0.0, 1.0]]);
+        assert!(store.embeddings_of_file(&root().join("missing.txt")).unwrap().is_empty());
+    }
+
     #[test]
     fn skipped_files_are_tracked_but_not_counted() {
         let mut store = IndexStore::open_in_memory(identity()).unwrap();
         let path = root().join("blob.bin");
-        store.record_skipped_file(&path, &record(1)).unwrap();
+        store.record_skipped_file(&path, &record(1), SkipReason::Binary).unwrap();
         let scope = PathScope::new(&root());
         assert!(store.files_in_scope(&scope).unwrap().contains_key(&path));
         assert_eq!(store.statistics(&scope).unwrap().files, 0);
+        assert_eq!(
+            store.skipped_files(&scope).unwrap(),
+            [SkippedFile { path: path.clone(), reason: Some(SkipReason::Binary) }]
+        );
+
+        // Once the file produces chunks it is no longer skipped, and its reason is dropped.
+        store.replace_text_file(&path, &record(2), &[chunk("now text", [1.0, 0.0])]).unwrap();
+        assert!(store.skipped_files(&scope).unwrap().is_empty());
+        store.record_skipped_file(&path, &record(3), SkipReason::Binary).unwrap();
+        store.remove_file(&path).unwrap();
+        let reasons: i64 =
+            store.connection.query_row("SELECT COUNT(*) FROM skipped_files", [], |row| row.get(0)).unwrap();
+        assert_eq!(reasons, 0, "a removed file's reason goes with it");
     }
 
     #[test]

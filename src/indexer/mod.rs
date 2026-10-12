@@ -23,7 +23,7 @@ use crate::documents::extract_pdf_text;
 use crate::encoder::{Document, Encoder};
 use crate::media::{LoadedImage, load_image};
 use crate::segments::MediaSegmentation;
-use crate::store::{FileRecord, IndexStore, PathScope};
+use crate::store::{FileRecord, IndexStore, PathScope, SkipReason};
 use recordings::{PendingRecording, embed_recordings};
 
 /// Chunks gathered before calling the encoder; the encoder splits them into token-budget batches.
@@ -133,7 +133,7 @@ pub fn index_directory(
     let discovery = discover_files(root, &options.discovery)?;
     let mut summary = IndexSummary {
         files_seen: discovery.files.len(),
-        files_skipped_too_large: discovery.skipped_too_large,
+        files_skipped_too_large: discovery.too_large.len(),
         ..IndexSummary::default()
     };
 
@@ -221,7 +221,7 @@ fn queue_changed_file(
                 pending.texts.push(PendingText { path, record, kind: FileKind::Text, chunks: chunks.collect() });
             }
             None => {
-                store.record_skipped_file(&path, &record)?;
+                store.record_skipped_file(&path, &record, SkipReason::Binary)?;
                 summary.files_skipped_binary += 1;
             }
         },
@@ -231,11 +231,11 @@ fn queue_changed_file(
                 pending.texts.push(PendingText { path, record, kind: FileKind::Pdf, chunks });
             }
             Ok(_) => {
-                store.record_skipped_file(&path, &record)?;
+                store.record_skipped_file(&path, &record, SkipReason::PdfWithoutText)?;
                 summary.pdfs_without_text += 1;
             }
             Err(_) => {
-                store.record_skipped_file(&path, &record)?;
+                store.record_skipped_file(&path, &record, SkipReason::PdfUnreadable)?;
                 summary.pdfs_unreadable += 1;
             }
         },
@@ -258,7 +258,7 @@ fn chunk_pdf_pages(pages: &[String], chunking: &ChunkingConfig) -> Vec<PendingCh
         .collect()
 }
 
-fn metadata_matches(record: &FileRecord, file: &DiscoveredFile) -> bool {
+pub(crate) fn metadata_matches(record: &FileRecord, file: &DiscoveredFile) -> bool {
     record.size == file.size && record.modified_nanoseconds == file.modified_nanoseconds
 }
 
@@ -363,11 +363,11 @@ fn embed_images(
                     progress.files_embedded(summary.files_embedded, summary.chunks_embedded);
                 }
                 Ok(LoadedImage::TooSmall) => {
-                    store.record_skipped_file(&file.path, &file.record)?;
+                    store.record_skipped_file(&file.path, &file.record, SkipReason::ImageTooSmall)?;
                     summary.images_skipped_too_small += 1;
                 }
                 Err(_) => {
-                    store.record_skipped_file(&file.path, &file.record)?;
+                    store.record_skipped_file(&file.path, &file.record, SkipReason::ImageUnreadable)?;
                     summary.images_unreadable += 1;
                 }
             }
